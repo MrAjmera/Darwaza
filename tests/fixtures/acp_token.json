@@ -1,0 +1,8 @@
+{
+  "mandate_id": "acp-token-0001",
+  "principal_id": "user-krishna",
+  "expiry": "2030-01-01T00:00:00+00:00",
+  "signature": "stub-signature",
+  "merchant_id": "merchant-amazon",
+  "exact_amount": 49.99
+}
