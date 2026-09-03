@@ -167,15 +167,57 @@ by policy — become the thing deciding ALLOW/DENY/NEEDS_HUMAN. That's a
 stronger guarantee than "we told the model not to decide": the code path
 that could let it decide doesn't exist.
 
+## 7. The human approval gate is a persistent queue + CLI, and "Razorpay execution" honestly means order creation, not a full payment round-trip
+
+**Chosen:** `approval_queue.py` (`ApprovalQueue`, SQLite-backed, same
+pattern as `nonce_store.py`) holds NEEDS_HUMAN requests until a person
+resolves them via `python -m darwaza.cli review` /
+`approve <id>` / `deny <id>`. Approving or denying appends a *second*
+audit log entry for that mandate_id — so the audit trail for a
+NEEDS_HUMAN mandate reads as two lines: the deterministic flag, then the
+human's resolution, each independently hash-chained. Approving also
+triggers `razorpay_client.create_order()`, which creates a real
+Razorpay test-mode order (fails loudly, not silently, if
+`RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` aren't set).
+
+**What "execution" honestly means here:** `create_order()` proves the
+authorization decision reaches a real payment processor in test mode —
+it does not simulate an actual card/UPI payment completing, because that
+requires Razorpay's Checkout (a real frontend flow) or a separate
+test-mode payment-simulation call. Darwaza's stated scope is the
+authorization gateway, not the checkout UI (see the project's problem
+statement) — so "order create + capture" in the build plan is satisfied
+as "a real order exists in Razorpay's test environment, correctly
+configured to auto-capture," not as "money moved end-to-end with no
+human or frontend involved anywhere." Said directly here rather than
+implied by a reassuring function name.
+
+**Why the audit trail gets two entries instead of one being edited:**
+the append-only hash-chained log (see the original audit_log.py
+decision) cannot edit a past entry without breaking the chain, which is
+the entire point of it — a NEEDS_HUMAN flag is not corrected in place
+into an ALLOW, it is followed by a new, separately-chained entry
+recording that a human made a decision. A dispute reconstruction reads
+both lines and sees exactly what the deterministic engine flagged and
+exactly what a human then decided, with a timestamp and reason for each.
+
 ## Open items
 
 - **Multi-instance replay protection isn't solved.** A single SQLite
   file is correct for one process/one merchant instance, but doesn't
   coordinate across multiple concurrent instances (e.g. horizontally
-  scaled) the way a shared service (Redis, a real DB) would.
+  scaled) the way a shared service (Redis, a real DB) would. The
+  approval queue has the identical limitation, for the identical reason.
 - **Key management is out of scope.** One hardcoded keypair stands in for
   every principal (see decision 3 above) — no registration, issuance, or
   rotation flow exists.
 - **The 0.5 human-review threshold is a placeholder**, not a tuned risk
   model (see decision #5). Naming this directly rather than presenting
   0.5 as considered.
+- **Razorpay execution stops at order creation** (see decision #7) — no
+  actual payment is simulated end-to-end without a frontend or a
+  separate test-payment call.
+- **`decide_with_llm()` in buyer_agent.py is untested by the automated
+  suite** — it requires a live `ANTHROPIC_API_KEY` and isn't
+  reproducible enough to assert on in CI; the deterministic path is
+  what's actually proven to work.

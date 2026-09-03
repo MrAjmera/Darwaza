@@ -301,3 +301,96 @@ not — gets to say about itself."
 - The LLM explainer (downstream-only, see DECISIONS.md #6) and the human
   approval gate for NEEDS_HUMAN cases are still unbuilt.
 - Razorpay test-mode execution is still unbuilt.
+
+---
+
+## Entry 5 — LLM explainer + human approval gate + Razorpay order creation
+
+This is the entry that closes the loop: everything a NEEDS_HUMAN
+decision needs to become a real, resolved, executed (or rejected)
+transaction, end to end.
+
+### What was missing before this
+NEEDS_HUMAN was reachable (Entry 3) but a dead end — nothing explained
+*why* to a reviewer, nothing recorded a human's decision, and nothing
+ever reached Razorpay at all, for any outcome.
+
+### What changed
+Four new pieces:
+
+- **`llm_explainer.py`** — `explain(mandate, proposed_tx, decision)`.
+  Called only on an already-final NEEDS_HUMAN decision; produces a
+  plain-language note for the human reviewer. Raises if called on
+  ALLOW/DENY — on purpose, see DECISIONS.md #6. Falls back to a clearly
+  labeled deterministic template when `ANTHROPIC_API_KEY` isn't set, so
+  the whole flow runs with or without a live key.
+- **`approval_queue.py`** — `ApprovalQueue`, a SQLite-backed pending
+  queue (same shape as `nonce_store.py`): `enqueue()`, `list_pending()`,
+  `resolve()`. A NEEDS_HUMAN result sits here until a person acts on it.
+- **`razorpay_client.py`** — `create_order()`, called only after a human
+  approves. Requires real test-mode `RAZORPAY_KEY_ID`/
+  `RAZORPAY_KEY_SECRET`; raises immediately (doesn't silently no-op) if
+  they're missing. See DECISIONS.md #7 for exactly what "order creation"
+  does and doesn't prove.
+- **`cli.py`** — three new commands: `review` (list pending),
+  `approve <id>` / `deny <id>` (resolve one, append a second audit log
+  entry recording the human's decision, and — if approved — attempt the
+  Razorpay order).
+
+### The concept, in one line
+A NEEDS_HUMAN decision only means something if there's a real place for
+a human to see it, decide on it, and have that decision recorded —
+otherwise "flagged for review" is just a different word for "ignored."
+
+### How to see it work
+```
+cd darwaza
+python -m darwaza.cli simulate needs-human
+# -> NEEDS_HUMAN, prints a request id and an explanation
+
+python -m darwaza.cli review
+# -> lists the pending request
+
+python -m darwaza.cli approve <request_id>
+# -> APPROVED, a second audit log entry is written, and (without
+#    Razorpay keys configured) prints exactly why no order was created
+#    rather than pretending one was
+```
+Set `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` (test-mode keys from your
+Razorpay dashboard) before `approve` to see a real order get created.
+
+Tests: `tests/test_llm_explainer.py`, `tests/test_approval_queue.py`,
+`tests/test_razorpay_client.py` (fails loudly without keys — no live
+call is exercised in the automated suite), and
+`tests/test_cli_approval_flow.py`, which runs the CLI as a real
+subprocess through `simulate` -> `review` -> `approve` end to end.
+
+### What it proves
+That a NEEDS_HUMAN decision is not a dead end: it reaches a human, gets
+an explanation a human can actually use, gets a recorded decision, and
+(when configured) reaches a real payment processor — all without the
+LLM ever touching the ALLOW/DENY/NEEDS_HUMAN decision itself.
+
+### What to say in the pitch video
+"When something needs a human, it doesn't just log a warning and move
+on — it sits in a queue, with a plain-language explanation, until a
+person actually approves or denies it. That decision gets its own audit
+log entry, chained to the one before it. Only a human's approval ever
+reaches Razorpay — the model never got a vote."
+
+### What's still open after this entry — the honest end-of-build state
+- Multi-instance coordination isn't solved for the nonce store *or* the
+  approval queue — both are single-file, single-instance.
+- Key management (per-principal Ed25519 keys) is out of scope by design.
+- The 0.5 human-review threshold is a placeholder, not a tuned model.
+- Razorpay "execution" stops at order creation — no full payment
+  round-trip without a frontend (see DECISIONS.md #7).
+- `decide_with_llm()` (the real, live prompt-injection demo) needs a key
+  you supply and isn't part of the automated suite.
+
+At this point every major component in the original build plan exists in
+some form: schema, deterministic policy engine, signature verification,
+persistent replay detection, NEEDS_HUMAN, a buyer-agent simulator with a
+real attack, an LLM explainer, a human approval gate, and Razorpay order
+creation. What's left is tuning, hardening, and recording the pitch
+video — not new components.

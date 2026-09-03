@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import json
 
-from darwaza.simulate import scenario_happy_path, scenario_poisoned_catalog
+from darwaza.simulate import (
+    scenario_happy_path,
+    scenario_large_purchase_needs_human,
+    scenario_poisoned_catalog,
+)
 
 
 def test_happy_path_scenario_allows_and_logs(tmp_path):
@@ -38,3 +42,16 @@ def test_poisoned_catalog_scenario_is_denied_and_logs_why(tmp_path):
     entry = json.loads(log_path.read_text().strip().splitlines()[-1])
     assert entry["outcome"] == "DENY"
     assert entry["failed_check"] == "amount_cap"
+
+
+def test_large_purchase_scenario_needs_human_and_logs(tmp_path):
+    log_path = tmp_path / "audit_log.jsonl"
+    nonce_db_path = tmp_path / "nonces.db"
+
+    result = scenario_large_purchase_needs_human(log_path=log_path, nonce_db_path=nonce_db_path)
+
+    assert result.decision.outcome == "NEEDS_HUMAN"
+    assert result.decision.failed_check == "human_review_threshold"
+
+    entry = json.loads(log_path.read_text().strip().splitlines()[-1])
+    assert entry["outcome"] == "NEEDS_HUMAN"

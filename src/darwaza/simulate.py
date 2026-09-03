@@ -22,7 +22,7 @@ from darwaza import buyer_agent, keys
 from darwaza.audit_log import append_entry
 from darwaza.nonce_store import NonceStore
 from darwaza.policy_engine import evaluate
-from darwaza.schema import Decision, NormalizedMandate
+from darwaza.schema import Decision, NormalizedMandate, ProposedTransaction
 
 PRINCIPAL_ID = "user-krishna"
 
@@ -43,11 +43,14 @@ def _signed_mandate(mandate_id: str, **overrides) -> NormalizedMandate:
 
 
 class ScenarioResult:
-    """What a scenario produced: the mandate id involved (so a caller can
-    print/log it) and the Decision evaluate() returned."""
+    """What a scenario produced: the mandate and proposed transaction
+    involved (so a caller can enqueue a NEEDS_HUMAN result for human
+    review, or just print/log them) and the Decision evaluate() returned."""
 
-    def __init__(self, mandate_id: str, decision: Decision) -> None:
-        self.mandate_id = mandate_id
+    def __init__(self, mandate: NormalizedMandate, proposed_tx, decision: Decision) -> None:
+        self.mandate = mandate
+        self.mandate_id = mandate.mandate_id
+        self.proposed_tx = proposed_tx
         self.decision = decision
 
 
@@ -67,7 +70,7 @@ def _run(
         store.close()
 
     append_entry(log_path, mandate.mandate_id, decision)
-    return ScenarioResult(mandate.mandate_id, decision)
+    return ScenarioResult(mandate, proposed_tx, decision)
 
 
 def scenario_happy_path(*, log_path: Path, nonce_db_path: Path) -> ScenarioResult:
@@ -91,7 +94,22 @@ def scenario_poisoned_catalog(*, log_path: Path, nonce_db_path: Path) -> Scenari
     return _run(mandate, proposed_tx, log_path=log_path, nonce_db_path=nonce_db_path)
 
 
+def scenario_large_purchase_needs_human(*, log_path: Path, nonce_db_path: Path) -> ScenarioResult:
+    """A legitimate (non-attack) purchase that happens to consume most of
+    the mandate's cap in one request — the NEEDS_HUMAN path, not an
+    attack. Amount is picked directly (not via buyer_agent) because this
+    scenario is about the threshold rule in policy_engine.py, not about
+    catalog manipulation. Expected: NEEDS_HUMAN, failed_check
+    "human_review_threshold"."""
+    mandate = _signed_mandate("sim-needs-human-1")
+    proposed_tx = ProposedTransaction(
+        merchant_id="merchant-bestbuy", amount=650.0, category="electronics"
+    )
+    return _run(mandate, proposed_tx, log_path=log_path, nonce_db_path=nonce_db_path)
+
+
 SCENARIOS = {
     "happy-path": scenario_happy_path,
     "poisoned-catalog": scenario_poisoned_catalog,
+    "needs-human": scenario_large_purchase_needs_human,
 }

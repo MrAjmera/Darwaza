@@ -5,5 +5,6 @@ __pycache__/
 *.egg-info/
 audit_log.jsonl
 nonces.db
+approvals.db
 .env
 _to_delete/
