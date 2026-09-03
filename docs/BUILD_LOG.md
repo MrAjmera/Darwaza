@@ -80,3 +80,73 @@ not hidden."
   by design, see DECISIONS.md #3.
 - Buyer-agent simulator, the one LLM judgment call, human approval gate,
   and Razorpay test-mode execution are all still unbuilt.
+
+---
+
+## Entry 2 — Persistent replay detection (SQLite nonce store)
+
+### What was stubbed before this
+The CLI kept spent mandate ids in a plain Python `set()`. That set lived
+only in process memory — every time the CLI process exited (which is
+every single command, since `python -m darwaza.cli decide ...` runs
+once and quits), the set was thrown away. So the second half of the
+"replayed mandate" attack test was true in the test suite (same process,
+same set) but false in reality (separate process each time): you could
+replay a mandate for real just by re-running the command.
+
+### What changed
+- **`src/darwaza/nonce_store.py`** (new) — `NonceStore`, backed by a
+  small SQLite file, with the same two operations code already used on
+  the in-memory set: `mandate_id in store` and `store.add(mandate_id)`.
+- **`cli.py`** — swapped `_SEEN_NONCES: set[str] = set()` for
+  `NonceStore(DEFAULT_NONCE_DB_PATH)`, writing to `nonces.db` next to
+  `audit_log.jsonl`.
+- **`policy_engine.evaluate()` did not change at all.** It never knew or
+  cared whether `seen_nonces` was a `set()` or something else — it only
+  ever called `in` and relied on the caller to call `.add()`. That's why
+  this was a safe, small change: the enforcement logic stayed exactly as
+  pure and untouched as DECISIONS.md #2 requires.
+
+### The concept, in one line
+"Replay protection" only means something if the record of what's already
+been spent survives as long as the mandate itself could be replayed —
+memory that resets on restart isn't a record, it's a coincidence that
+happened to work during one continuous run.
+
+### How to see it work
+```
+cd darwaza
+python -m darwaza.cli decide tests/fixtures/ap2_mandate.json tests/fixtures/ap2_proposed_tx.json
+# -> ALLOW (first use)
+python -m darwaza.cli decide tests/fixtures/ap2_mandate.json tests/fixtures/ap2_proposed_tx.json
+# -> DENY, failed_check: replay — even though this is a brand-new process
+```
+Before this entry, the second run above would have said ALLOW again,
+because the first run's in-memory set no longer existed. A `nonces.db`
+SQLite file appears in the repo root after the first run — delete it to
+reset the demo state.
+
+Tests: `pytest -q` — `tests/test_nonce_store.py`, especially
+`test_persists_across_separate_store_instances`, which is the exact bug
+this entry fixes, written as a test (two separate `NonceStore` objects
+pointed at the same file, simulating a process restart).
+
+### What it proves
+That "replay detection" is real across restarts, not just within one
+Python process — the gap between "looks correct in a demo" and "would
+actually stop a replay attack in the field" is closed for this one
+check.
+
+### What to say in the pitch video
+"The replay check isn't just logic — it's backed by a file on disk, so
+restarting the service doesn't reset what counts as already-spent. This
+is one SQLite file for one instance, which is honestly scoped: it's not
+solving replay protection across multiple horizontally-scaled instances,
+and that's named directly in DECISIONS.md, not glossed over."
+
+### What's still open after this entry
+- Multi-instance coordination isn't solved (see DECISIONS.md #4) — fine
+  for a demo/single-instance system, not for a scaled deployment.
+- Key management is still out of scope by design.
+- Buyer-agent simulator, the one LLM judgment call, human approval gate,
+  and Razorpay test-mode execution are all still unbuilt.

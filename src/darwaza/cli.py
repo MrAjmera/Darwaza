@@ -7,14 +7,18 @@ import sys
 from pathlib import Path
 
 from darwaza.audit_log import append_entry
+from darwaza.nonce_store import NonceStore
 from darwaza.policy_engine import evaluate
 from darwaza.schema import NormalizedMandate, ProposedTransaction
 
 DEFAULT_LOG_PATH = Path(__file__).resolve().parent.parent.parent / "audit_log.jsonl"
+DEFAULT_NONCE_DB_PATH = Path(__file__).resolve().parent.parent.parent / "nonces.db"
 
-# In-memory only for this CLI process — see policy_engine.evaluate() and
-# DECISIONS.md for why this isn't real replay protection across runs.
-_SEEN_NONCES: set[str] = set()
+# Persistent across CLI invocations and process restarts — see
+# nonce_store.py and DECISIONS.md. Previously an in-memory set() that
+# reset every run, which meant replay protection only worked within a
+# single process's lifetime.
+_SEEN_NONCES = NonceStore(DEFAULT_NONCE_DB_PATH)
 
 
 def _load(path: str):

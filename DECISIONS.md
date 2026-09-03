@@ -87,13 +87,33 @@ in `test_policy_engine.py` / `test_attacks.py`, and the regenerated
 closes: an agent impersonating a principal it doesn't represent, without
 holding that principal's key.
 
+## 4. Persistent replay detection via a single-table SQLite store
+
+**Chosen:** `nonce_store.py` adds `NonceStore`, a thin SQLite-backed
+class implementing exactly the two operations `evaluate()` already used
+on `seen_nonces` — `x in store` and `store.add(x)`. The CLI now passes a
+`NonceStore` pointed at `nonces.db` instead of a `set()`.
+
+**Rejected:** A "real" queue/cache system (Redis, a message broker);
+changing `evaluate()`'s signature to take something more specific than
+"a thing that supports `in` and `add`."
+
+**Why:** The bug being fixed is narrow: a mandate marked as spent must
+stay spent after the process restarts. SQLite in a single file solves
+exactly that, with no new service to run or configure — appropriate for
+a demo/single-merchant-instance system, called out explicitly as not
+sufficient for multiple concurrent instances (see open items). Keeping
+`evaluate()`'s parameter untyped beyond "supports `in`/`add`" means the
+pure-function contract from decision #2 doesn't change at all — tests
+can still pass a plain `set()`, and the persistence choice lives entirely
+in the caller (the CLI), not in the policy engine.
+
 ## Open items
 
-- **Replay detection is in-memory only.** The seen-nonce set used to
-  detect replayed mandates lives in process memory and is lost on
-  restart, and won't work across multiple instances. It needs to move to
-  persistent storage (e.g. a database or Redis) before this is anything
-  more than a demo.
+- **Multi-instance replay protection isn't solved.** A single SQLite
+  file is correct for one process/one merchant instance, but doesn't
+  coordinate across multiple concurrent instances (e.g. horizontally
+  scaled) the way a shared service (Redis, a real DB) would.
 - **Key management is out of scope.** One hardcoded keypair stands in for
   every principal (see decision 3 above) — no registration, issuance, or
   rotation flow exists.
