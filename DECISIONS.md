@@ -55,15 +55,45 @@ reasoning is ever useful (e.g. summarizing *why* something looks
 suspicious for a human reviewer), it belongs strictly downstream of the
 ALLOW/DENY/NEEDS_HUMAN decision, never as part of making it.
 
+## 3. Ed25519 signature verification with one hardcoded demo keypair
+
+**Chosen:** `NormalizedMandate.signing_payload()` (schema.py) serializes
+every field except `signature` into deterministic bytes (sorted keys,
+fixed separators). `keys.sign()`/`keys.verify()` wrap a single hardcoded
+Ed25519 keypair. `policy_engine.verify_signature()` now actually checks:
+does this signature verify against these exact bytes, with this key? Any
+mismatch — forged signature, or a legitimate signature over fields that
+were changed afterward — returns False, which `evaluate()` turns into
+`DENY / failed_check="signature"`.
+
+**Rejected (for this build):** Per-principal keys with a registration
+flow; a KMS or hardware-backed key store; key rotation.
+
+**Why:** The signature check exists to answer one question: did the
+transaction the gate is looking at actually come from something the
+principal signed, unmodified? A single fixed keypair is enough to prove
+that mechanism works — real forgery is rejected, real tampering is
+detected — without building the much bigger (and out-of-scope, see the
+build plan's cuts) problem of key management for many principals. This
+is explicitly a demo shortcut, not a claim that key management is solved;
+said so directly in the code (`keys.py`) and here, so it can't be
+mistaken for something it isn't in front of a panel.
+
+**What changed as a result:** every mandate fixture and every mandate
+built in the tests now carries a real signature (see `_signed()` helpers
+in `test_policy_engine.py` / `test_attacks.py`, and the regenerated
+`tests/fixtures/*.json`). A new adversarial test,
+`test_attack_forged_signature_is_denied`, covers the attack class this
+closes: an agent impersonating a principal it doesn't represent, without
+holding that principal's key.
+
 ## Open items
 
-- **Signature verification is stubbed.** `policy_engine.verify_signature()`
-  currently always returns `True`. Real Ed25519 verification is out of
-  scope for this session and needs to be implemented before this system
-  handles anything real. Until then, the "signature valid" check is not
-  actually checking anything.
 - **Replay detection is in-memory only.** The seen-nonce set used to
   detect replayed mandates lives in process memory and is lost on
   restart, and won't work across multiple instances. It needs to move to
   persistent storage (e.g. a database or Redis) before this is anything
   more than a demo.
+- **Key management is out of scope.** One hardcoded keypair stands in for
+  every principal (see decision 3 above) — no registration, issuance, or
+  rotation flow exists.

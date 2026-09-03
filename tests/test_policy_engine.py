@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from darwaza import keys
 from darwaza.policy_engine import evaluate
 from darwaza.schema import NormalizedMandate, ProposedTransaction
 
@@ -11,18 +12,29 @@ FUTURE = datetime.now(timezone.utc) + timedelta(days=1)
 PAST = datetime.now(timezone.utc) - timedelta(days=1)
 
 
+def _signed(mandate: NormalizedMandate) -> NormalizedMandate:
+    """Return `mandate` with a real signature over its current fields —
+    what a legitimate signer would have produced. Every helper below
+    signs by default so every existing test still exercises "a validly
+    signed mandate," which is what makes it a fair test of the *other*
+    checks; tests for the signature check itself pass an explicit
+    (invalid) `signature=` override instead, which skips this."""
+    return mandate.model_copy(update={"signature": keys.sign(mandate.signing_payload())})
+
+
 def ap2_mandate(**overrides) -> NormalizedMandate:
     defaults = dict(
         mandate_id="ap2-1",
         principal_id="p1",
         expiry=FUTURE,
-        signature="sig",
+        signature="unsigned-placeholder",
         agent_id="agent-1",
         max_amount=1000.0,
         category_scope=["electronics"],
     )
     defaults.update(overrides)
-    return NormalizedMandate(**defaults)
+    m = NormalizedMandate(**defaults)
+    return m if "signature" in overrides else _signed(m)
 
 
 def acp_token(**overrides) -> NormalizedMandate:
@@ -30,12 +42,13 @@ def acp_token(**overrides) -> NormalizedMandate:
         mandate_id="acp-1",
         principal_id="p1",
         expiry=FUTURE,
-        signature="sig",
+        signature="unsigned-placeholder",
         merchant_id="merchant-a",
         exact_amount=50.0,
     )
     defaults.update(overrides)
-    return NormalizedMandate(**defaults)
+    m = NormalizedMandate(**defaults)
+    return m if "signature" in overrides else _signed(m)
 
 
 def tx(**overrides) -> ProposedTransaction:
@@ -44,13 +57,30 @@ def tx(**overrides) -> ProposedTransaction:
     return ProposedTransaction(**defaults)
 
 
-# a. signature — stubbed to always pass right now, so we can only assert
-#    the passing case. The failing case is impossible to construct until
-#    verify_signature() is implemented for real (tracked in DECISIONS.md).
-def test_signature_stub_always_passes():
-    m = ap2_mandate()
+# a. signature
+def test_signature_valid_passes():
+    m = ap2_mandate()  # signed by the default helper
     result = evaluate(m, tx(amount=100), set())
     assert result.failed_check != "signature"
+
+
+def test_signature_garbage_fails():
+    m = ap2_mandate(signature="not-a-real-signature")
+    result = evaluate(m, tx(amount=100), set())
+    assert result.outcome == "DENY"
+    assert result.failed_check == "signature"
+
+
+def test_signature_tampered_field_fails():
+    # Sign a mandate honestly, then mutate a field afterward — simulating
+    # an attacker who intercepts a valid mandate and raises their own cap.
+    # model_copy() changes the field without re-signing, so the signature
+    # no longer matches what verify_signature() re-derives.
+    m = ap2_mandate(max_amount=1000.0)
+    tampered = m.model_copy(update={"max_amount": 999999.0})
+    result = evaluate(tampered, tx(amount=50000.0), set())
+    assert result.outcome == "DENY"
+    assert result.failed_check == "signature"
 
 
 # b. expiry

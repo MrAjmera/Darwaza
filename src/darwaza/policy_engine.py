@@ -7,17 +7,24 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from darwaza import keys
 from darwaza.schema import Decision, NormalizedMandate, Outcome, ProposedTransaction
 
 
 def verify_signature(mandate: NormalizedMandate) -> bool:
-    """Stub — always returns True.
+    """Verify the mandate was signed, in full, by the demo principal
+    keypair (darwaza.keys) — i.e. that every field on it is exactly what
+    the principal signed, not a value an attacker added or changed
+    afterward.
 
-    TODO: real Ed25519 signature verification. Tracked as an open item in
-    DECISIONS.md. Until this is implemented, the "signature valid" check
-    below is not actually protecting against a forged mandate.
+    `mandate.signing_payload()` re-derives the same canonical bytes the
+    signer produced; `keys.verify()` checks the signature against those
+    bytes with the public key. Any mismatch — wrong key, tampered field,
+    malformed signature — returns False here, which the caller turns into
+    a DENY. See DECISIONS.md: this was the last stubbed check in the
+    engine (previously always returned True).
     """
-    return True
+    return keys.verify(mandate.signing_payload(), mandate.signature)
 
 
 def evaluate(

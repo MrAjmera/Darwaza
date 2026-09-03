@@ -5,3 +5,4 @@ __pycache__/
 *.egg-info/
 audit_log.jsonl
 .env
+_to_delete/

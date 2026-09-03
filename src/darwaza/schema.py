@@ -6,6 +6,7 @@ protocol deeply.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from enum import Enum
 
@@ -77,3 +78,20 @@ class NormalizedMandate(BaseModel):
     # ACP-only: expresses exact, merchant-bound, single-use permission.
     merchant_id: str | None = None
     exact_amount: float | None = None
+
+    def signing_payload(self) -> bytes:
+        """The exact bytes a signature is computed over and verified
+        against — every field except `signature` itself, serialized
+        deterministically (sorted keys, fixed separators) so the signer
+        and the verifier always land on identical bytes for identical
+        mandate content.
+
+        This is what makes signature verification mean something beyond
+        "some signature is present": if an attacker changes so much as
+        one field after the mandate was signed (e.g. bumping
+        `max_amount`), these bytes change, the signature no longer
+        matches, and `verify_signature()` denies it — see
+        policy_engine.verify_signature() and DECISIONS.md.
+        """
+        data = self.model_dump(mode="json", exclude={"signature"})
+        return json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
