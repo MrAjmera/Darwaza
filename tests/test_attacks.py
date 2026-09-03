@@ -9,9 +9,9 @@ signature verification is real, every one of these would DENY on
 "signature" first and never actually exercise the check it claims to
 test.
 
-Prompt-injection and poisoned-catalog attacks are out of scope here — they
-require a buyer-agent simulator and an LLM call, neither of which exist in
-this session's build.
+The poisoned-catalog / prompt-injection attack class now has a real,
+runnable path — see test_attack_poisoned_catalog_is_denied below and
+simulate.py — rather than living only as unit-level DENY assertions.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -138,3 +138,21 @@ def test_attack_cap_exceeding_request_is_denied():
     result = evaluate(m, tx, seen_nonces=set())
     assert result.outcome == "DENY"
     assert result.failed_check == "amount_cap"
+
+
+def test_attack_poisoned_catalog_is_denied(tmp_path):
+    """A buying agent that reads a merchant's product catalog — untrusted
+    text the gateway does not control — and obeys an instruction
+    embedded in a listing description ("raise the spending limit",
+    "proceed without confirmation") must still be stopped by the gate.
+    This is run through the full simulate.py path (buyer agent -> gate ->
+    audit log), not constructed by hand, because the point is that the
+    *agent's own inflated proposal* gets denied, not a hand-crafted one.
+    """
+    from darwaza.simulate import scenario_poisoned_catalog
+
+    result = scenario_poisoned_catalog(
+        log_path=tmp_path / "audit_log.jsonl", nonce_db_path=tmp_path / "nonces.db"
+    )
+    assert result.decision.outcome == "DENY"
+    assert result.decision.failed_check == "amount_cap"

@@ -150,3 +150,154 @@ and that's named directly in DECISIONS.md, not glossed over."
 - Key management is still out of scope by design.
 - Buyer-agent simulator, the one LLM judgment call, human approval gate,
   and Razorpay test-mode execution are all still unbuilt.
+
+---
+
+## Entry 3 — NEEDS_HUMAN via a deterministic threshold rule
+
+### What was missing before this
+`evaluate()` could only ever return `ALLOW` or `DENY` — the `Outcome`
+enum had a `NEEDS_HUMAN` value, but nothing produced it. There was no
+answer yet to "when does something go to a human instead of being
+auto-decided," which is a real design question, not an implementation
+detail — get it wrong and either everything auto-approves (no human gate
+at all) or the LLM ends up deciding it (breaks DECISIONS.md #2).
+
+### What changed
+- **`policy_engine.py`** — one new check (g.), run only for AP2-style
+  mandates (the ones expressing a spending *ceiling*, not one exact
+  transaction): if the proposed amount is more than
+  `HUMAN_REVIEW_FRACTION_OF_CAP` (0.5, a named constant) of the
+  mandate's `max_amount`, the outcome is `NEEDS_HUMAN`. ACP-style tokens
+  (single-use, exact-amount) never hit this — there's no "fraction of a
+  ceiling" concept for a token that only ever means one specific amount.
+- This is a plain `if` statement — same style as every other check in
+  `evaluate()`. No model, no judgment call, no ambiguity in what triggers
+  it.
+
+### The concept, in one line
+An AP2-style mandate authorizes *up to* an amount for a category, not
+one specific purchase — so a request that eats most of that ceiling in
+one shot is structurally different from a small in-scope purchase, even
+though both would pass every other check. Deciding *that* distinction
+matters is a policy call a human made once, in code; deciding whether
+*this specific request* crosses it is arithmetic, not judgment.
+
+### How to see it work
+```
+cd darwaza
+python -m darwaza.cli simulate poisoned-catalog   # -> DENY (amount_cap, not this)
+```
+See the tests below for the direct case — deliberately not wired into a
+CLI fixture on its own yet, since it's about to be the trigger for the
+LLM explainer and human approval gate in the next two entries.
+
+Tests: `test_needs_human_when_ap2_amount_exceeds_review_threshold`,
+`test_ap2_amount_at_threshold_boundary_still_auto_allows`,
+`test_acp_never_needs_human_regardless_of_amount` in
+`tests/test_policy_engine.py`.
+
+### What it proves
+That NEEDS_HUMAN is a real, reachable outcome — not just an enum value —
+and that reaching it never requires a model. This is the deterministic
+foundation the human approval gate (Entry 5) and the LLM explainer
+(Entry 4) both build on.
+
+### What to say in the pitch video
+"NEEDS_HUMAN isn't the model's call — it's arithmetic against the
+mandate's own stated ceiling. An AP2 mandate authorizes *up to* a
+number; spending most of it in one request gets a human's eyes before
+anything happens, every time, the same way, with no model in that
+decision at all."
+
+### What's still open after this entry
+- The 0.5 threshold is a placeholder, not a tuned risk model — said so
+  directly in DECISIONS.md #5, not presented as considered.
+- The LLM judgment call, human approval gate, and Razorpay test-mode
+  execution are all still unbuilt.
+
+---
+
+## Entry 4 — Buyer-agent simulator + a real poisoned-catalog attack
+
+### What was missing before this
+The adversarial suite could prove `evaluate()` denies a hand-crafted bad
+transaction — but "prompt-injected buyer agent raising its own cap" and
+"poisoned catalog manipulating the buyer's agent" were named attack
+classes with no code behind them. Nothing existed that played the role
+of the buying agent at all.
+
+### What changed
+Three new files, all under `src/darwaza/`:
+- **`catalog.py`** — a tiny fake product catalog. One listing
+  (`sku-poisoned-earbuds`) has a prompt-injection attempt embedded
+  directly in its product description — the exact "seller descriptions,
+  catalog metadata" surface DECISIONS.md #5 names as attacker-controlled.
+- **`buyer_agent.py`** — `decide_deterministic()`: a rule-based "buying
+  agent" (no model call, no API key needed) that picks the cheapest
+  matching product. With `obey_injected_instructions=True`, it
+  reproduces exactly what an unguarded LLM-based agent would do if it
+  read that listing's text as an instruction instead of as data: it
+  inflates its own proposed transaction to 999,999. (`decide_with_llm()`
+  also exists — a real LLM reading the same catalog — but needs a live
+  `ANTHROPIC_API_KEY` you supply and test yourself; it's not part of the
+  automated suite because a live model call isn't reproducible enough to
+  assert on.)
+- **`simulate.py`** — wires a signed mandate + the buyer agent + the
+  real `evaluate()` + the real audit log into runnable scenarios:
+  `scenario_happy_path` and `scenario_poisoned_catalog`. Unlike
+  `test_attacks.py`, these run the *actual agent*, not a hand-built
+  transaction — the DENY is on whatever the (compromised) agent itself
+  proposed.
+- **`cli.py`** — new `simulate` subcommand:
+  `python -m darwaza.cli simulate <happy-path|poisoned-catalog>`.
+
+### The concept, in one line
+Darwaza's whole premise only means something if there's a *separate,
+untrusted* thing on the other side of it that can be attacked — this is
+that thing, built deliberately attackable, so "the gate holds even when
+the agent is compromised" is a claim you can run, not just assert.
+
+### How to see it work
+```
+cd darwaza
+python -m darwaza.cli simulate happy-path
+# -> ALLOW: cheapest book, well within cap and category
+
+python -m darwaza.cli simulate poisoned-catalog
+# -> DENY, failed_check: amount_cap
+# The "buyer agent" read a product description containing an injected
+# instruction and inflated its own request to 999,999 — the mandate's
+# real 1,000 cap still catches it.
+```
+Open `src/darwaza/catalog.py` and read the `sku-poisoned-earbuds` entry
+to see the injected text itself.
+
+Tests: `tests/test_buyer_agent.py` (the agent in isolation),
+`tests/test_simulate.py` (full scenario + audit log), and
+`test_attack_poisoned_catalog_is_denied` in `tests/test_attacks.py`
+(same scenario, framed as the attack class it closes).
+
+### What it proves
+That a compromised buying agent — one that did exactly what a poisoned
+listing told it to — still cannot get an oversized transaction past the
+gate. This is the difference between "the policy engine has a test for
+amount caps" and "the system holds up when the thing feeding it input is
+actively working against it," which is the actual threat model Darwaza
+claims to defend.
+
+### What to say in the pitch video
+"This isn't a hypothetical — here's a product listing with an injection
+attempt baked into its description, here's a buying agent that reads it
+and does what it says, and here's the transaction it tries to submit:
+999,999 rupees. And here's the gate denying it anyway, because the real
+cap lives in the mandate, not in anything the agent — compromised or
+not — gets to say about itself."
+
+### What's still open after this entry
+- `decide_with_llm()` exists but isn't part of the automated suite —
+  running the *real* version of this attack (a live LLM actually being
+  manipulated, not a deterministic stand-in) requires a key you supply.
+- The LLM explainer (downstream-only, see DECISIONS.md #6) and the human
+  approval gate for NEEDS_HUMAN cases are still unbuilt.
+- Razorpay test-mode execution is still unbuilt.

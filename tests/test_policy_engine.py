@@ -187,3 +187,27 @@ def test_full_allow_acp():
     result = evaluate(m, tx(merchant_id="merchant-a", amount=50.0), set())
     assert result.outcome == "ALLOW"
     assert result.failed_check is None
+
+
+# g. human review threshold (AP2-style only)
+def test_needs_human_when_ap2_amount_exceeds_review_threshold():
+    m = ap2_mandate(max_amount=1000.0, category_scope=["electronics"])
+    result = evaluate(m, tx(amount=800.0, category="electronics"), set())
+    assert result.outcome == "NEEDS_HUMAN"
+    assert result.failed_check == "human_review_threshold"
+
+
+def test_ap2_amount_at_threshold_boundary_still_auto_allows():
+    # Exactly 50% of the cap is the boundary — the check uses a strict
+    # ">" so the boundary itself still auto-allows.
+    m = ap2_mandate(max_amount=1000.0, category_scope=["electronics"])
+    result = evaluate(m, tx(amount=500.0, category="electronics"), set())
+    assert result.outcome == "ALLOW"
+
+
+def test_acp_never_needs_human_regardless_of_amount():
+    # ACP tokens are exact-amount and single-use — there is no "fraction
+    # of a ceiling" for them, so this check must never apply.
+    m = acp_token(exact_amount=999.0)
+    result = evaluate(m, tx(merchant_id="merchant-a", amount=999.0), set())
+    assert result.outcome == "ALLOW"

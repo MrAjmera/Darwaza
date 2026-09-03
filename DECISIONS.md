@@ -108,6 +108,65 @@ pure-function contract from decision #2 doesn't change at all — tests
 can still pass a plain `set()`, and the persistence choice lives entirely
 in the caller (the CLI), not in the policy engine.
 
+## 5. NEEDS_HUMAN is produced by a plain threshold rule, never by the LLM
+
+**Chosen:** `evaluate()` gained exactly one new branch (check g.): for an
+AP2-style mandate (has `max_amount`, i.e. expresses a ceiling rather than
+one exact transaction), if the proposed amount is more than
+`HUMAN_REVIEW_FRACTION_OF_CAP` (0.5) of that ceiling, the outcome is
+`NEEDS_HUMAN` — a plain, reproducible, deterministic rule, computed the
+same way every other check in this function is. ACP-style tokens
+(`exact_amount` set) never hit this branch — they're single-use and
+bound to one exact amount, so there's no "fraction of a ceiling" for
+them to be ambiguous about.
+
+**Rejected:** Having the LLM decide when a transaction needs human
+review — e.g. "ask the model whether this cart plausibly matches the
+mandate's stated intent, and route to NEEDS_HUMAN if it says no."
+
+**Why:** This is the direct, load-bearing consequence of decision #2. It
+isn't enough to say "no LLM call inside `evaluate()`" — decision #2 also
+says natural-language reasoning belongs "strictly downstream of the
+ALLOW/DENY/NEEDS_HUMAN decision, never as part of making it." If the LLM
+decided *whether* something needs human review, it would be back inside
+the decision path in every way that matters: a buying agent's inputs
+(product listings, seller descriptions, catalog metadata) are
+attacker-controlled text, and anything an LLM reads from that surface can
+carry instructions aimed at the model rather than at the merchant. Keeping
+the LLM strictly downstream of a decision that's already been made
+deterministically means a successful prompt injection can at worst
+produce a misleading *explanation* for a human reviewer to read — it can
+never flip ALLOW/DENY/NEEDS_HUMAN itself. The LLM's only job (see
+decision #6, `llm_explainer.py`) is to explain a NEEDS_HUMAN case in
+plain language *after* the threshold rule already flagged it.
+
+**Where the 0.5 threshold came from:** it's a placeholder that's honest
+about being one — chosen because it's an easy, round number to defend
+("more than half the mandate's stated ceiling, in one request, gets a
+human's eyes") rather than derived from any real risk model. A real
+deployment would tune this per-merchant or per-category; that tuning is
+out of scope here.
+
+## 6. The one LLM call is a downstream explainer, not a decision-maker
+
+**Chosen:** `llm_explainer.py` exposes one function,
+`explain(mandate, proposed_tx, decision) -> str`, called only after
+`evaluate()` has already returned `NEEDS_HUMAN`. It produces a
+plain-language summary for the human reviewer ("this request would spend
+80% of the mandate's ₹1000 electronics allowance in one transaction") —
+it never receives the ability to change `decision.outcome`, and nothing
+downstream re-parses its output as a decision. If no `ANTHROPIC_API_KEY`
+is configured, it falls back to a deterministic template string built
+from the same fields, clearly labeled as a fallback — so the demo runs
+end-to-end with or without a live API key, and the fallback path can
+never be mistaken for a real model output.
+
+**Why this shape specifically:** a function that takes a decision that
+was already made, and returns a string, cannot — structurally, not just
+by policy — become the thing deciding ALLOW/DENY/NEEDS_HUMAN. That's a
+stronger guarantee than "we told the model not to decide": the code path
+that could let it decide doesn't exist.
+
 ## Open items
 
 - **Multi-instance replay protection isn't solved.** A single SQLite
@@ -117,3 +176,6 @@ in the caller (the CLI), not in the policy engine.
 - **Key management is out of scope.** One hardcoded keypair stands in for
   every principal (see decision 3 above) — no registration, issuance, or
   rotation flow exists.
+- **The 0.5 human-review threshold is a placeholder**, not a tuned risk
+  model (see decision #5). Naming this directly rather than presenting
+  0.5 as considered.

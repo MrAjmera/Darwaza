@@ -6,9 +6,29 @@ explainable by exact rule, not by a model's judgment.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Protocol
 
 from darwaza import keys
 from darwaza.schema import Decision, NormalizedMandate, Outcome, ProposedTransaction
+
+# Fraction of an AP2-style mandate's max_amount ceiling above which a
+# transaction routes to human review instead of auto-approving. AP2
+# mandates express a *ceiling* for future purchases in a category, not
+# permission for one specific transaction — spending most of that
+# ceiling in a single request is exactly the case where "does this
+# actually match what the principal meant to authorize" deserves a human
+# glance rather than blind trust in the stated cap. See DECISIONS.md #5.
+HUMAN_REVIEW_FRACTION_OF_CAP = 0.5
+
+
+class NonceRegistry(Protocol):
+    """Structural type for `seen_nonces`: anything supporting membership
+    testing. Both a plain `set[str]` (tests) and `nonce_store.NonceStore`
+    (the CLI, persistent) satisfy this — `evaluate()` never calls `.add()`
+    itself, only the caller does, after a successful ALLOW, so `add` is
+    deliberately not part of this protocol."""
+
+    def __contains__(self, mandate_id: str) -> bool: ...
 
 
 def verify_signature(mandate: NormalizedMandate) -> bool:
@@ -30,17 +50,21 @@ def verify_signature(mandate: NormalizedMandate) -> bool:
 def evaluate(
     mandate: NormalizedMandate,
     proposed_tx: ProposedTransaction,
-    seen_nonces: set[str],
+    seen_nonces: NonceRegistry,
 ) -> Decision:
     """Run the mandate through every check in order, stopping at the first
-    failure. `seen_nonces` is passed in explicitly (rather than being
-    module-level state) so `evaluate` stays a pure function — no hidden
-    mutation, callers own the set and its lifetime.
+    DENY or NEEDS_HUMAN. `seen_nonces` is passed in explicitly (rather
+    than being module-level state) so `evaluate` stays a pure function —
+    no hidden mutation, callers own the registry and its lifetime, and
+    its persistence (in-memory `set()` vs. `nonce_store.NonceStore`) is
+    entirely the caller's choice — this function only ever reads it.
 
-    NOTE: seen_nonces is in-memory only. It resets on process restart and
-    won't be shared across multiple instances of this service — tracked as
-    an open item in DECISIONS.md. Real replay protection needs persistent
-    storage.
+    This is the only place in the system allowed to produce NEEDS_HUMAN
+    (see check g. and DECISIONS.md #5) — every branch here is a plain,
+    reproducible rule. No model is called anywhere in this function; if
+    an LLM-generated explanation is attached to a NEEDS_HUMAN decision,
+    that happens strictly after this function returns, never inside it
+    (DECISIONS.md #2).
     """
 
     # a. Signature must be valid, or nothing else about the mandate can be
@@ -124,6 +148,27 @@ def evaluate(
                     f"scope {mandate.category_scope}."
                 ),
                 failed_check="category_scope",
+            )
+
+    # g. Human review threshold (AP2-style mandates only): a mandate that
+    #    structurally passed every check above still isn't necessarily
+    #    safe to auto-approve if the request consumes most of the
+    #    mandate's ceiling in one shot. ACP-style tokens are exact-amount
+    #    and single-use — there's no "fraction of a ceiling" concept for
+    #    them, so they never reach this branch (mandate.max_amount is
+    #    None for a pure ACP token).
+    if mandate.max_amount is not None and mandate.exact_amount is None:
+        if proposed_tx.amount > HUMAN_REVIEW_FRACTION_OF_CAP * mandate.max_amount:
+            fraction = proposed_tx.amount / mandate.max_amount
+            return Decision(
+                outcome=Outcome.NEEDS_HUMAN,
+                reason=(
+                    f"Transaction amount {proposed_tx.amount} is {fraction:.0%} of "
+                    f"mandate cap {mandate.max_amount} — above the "
+                    f"{HUMAN_REVIEW_FRACTION_OF_CAP:.0%} auto-approve threshold, "
+                    "routed to human review."
+                ),
+                failed_check="human_review_threshold",
             )
 
     return Decision(
