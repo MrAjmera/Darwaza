@@ -5,6 +5,7 @@
   python -m darwaza.cli review
   python -m darwaza.cli approve <request_id>
   python -m darwaza.cli deny <request_id>
+  python -m darwaza.cli execute <request_id>
 
 Pure presentation: every actual decision, claim, log write, explanation,
 and enqueue happens in service.authorize() (see service.py and
@@ -14,6 +15,13 @@ _SEEN_NONCES module-level NonceStore, and the two near-identical copies
 of "evaluate -> log -> explain -> enqueue" that used to live in decide()
 and simulate(), are gone: both now just call service.authorize() and
 print whatever comes back.
+
+`execute` (Stage 6) is the recovery command for a request that was
+approved but never made it to Razorpay — a transient failure right after
+`approve`, or a crash between the two. `review` lists both what's still
+waiting on a human (`approve`/`deny`) and what's already approved but
+not yet executed (`execute`), so neither state is invisible from the
+terminal.
 """
 
 from __future__ import annotations
@@ -95,13 +103,25 @@ def review() -> None:
 
     if not pending:
         print("No pending approvals.")
-        return
+    else:
+        for row in pending:
+            print(f"[{row['id']}] mandate={row['mandate_id']}  created={row['created_at']}")
+            print(f"    reason:      {row['reason']}")
+            print(f"    explanation: {row['explanation']}")
+            print()
 
-    for row in pending:
-        print(f"[{row['id']}] mandate={row['mandate_id']}  created={row['created_at']}")
-        print(f"    reason:      {row['reason']}")
-        print(f"    explanation: {row['explanation']}")
-        print()
+    pending_execution = service.list_pending_execution()
+    if pending_execution:
+        print("Approved, pending execution (retry with 'execute <request_id>'):")
+        for row in pending_execution:
+            attempts = row["execution_attempts"]
+            print(
+                f"[{row['id']}] mandate={row['mandate_id']}  "
+                f"attempts={attempts}  created={row['created_at']}"
+            )
+            if row["last_execution_error"]:
+                print(f"    last error: {row['last_execution_error']}")
+            print()
 
 
 def _resolve(request_id: str, *, approved: bool) -> None:
@@ -127,6 +147,7 @@ def _resolve(request_id: str, *, approved: bool) -> None:
             print(f"Razorpay test-mode order created: {order_id}")
         else:
             print(f"(Razorpay order not created: {result.razorpay_error})")
+            print(f"Retry with: python -m darwaza.cli execute {request_id}")
 
 
 def approve(request_id: str) -> None:
@@ -137,6 +158,26 @@ def deny(request_id: str) -> None:
     _resolve(request_id, approved=False)
 
 
+def execute(request_id: str) -> None:
+    try:
+        result = service.execute_approval(request_id)
+    except service.ApprovalNotFoundError as exc:
+        print(str(exc))
+        sys.exit(1)
+    except service.ApprovalNotYetApprovedError as exc:
+        print(str(exc))
+        sys.exit(1)
+
+    if result.executed:
+        order_id = result.razorpay_order.get("id", result.razorpay_order)
+        print(f"Request {request_id}: EXECUTED")
+        print(f"Razorpay test-mode order: {order_id}")
+    else:
+        print(f"Request {request_id}: still not executed ({result.razorpay_error})")
+        print(f"Retry again with: python -m darwaza.cli execute {request_id}")
+        sys.exit(1)
+
+
 def main() -> None:
     usage = (
         "Usage:\n"
@@ -144,7 +185,8 @@ def main() -> None:
         "  python -m darwaza.cli simulate <" + "|".join(SCENARIOS) + ">\n"
         "  python -m darwaza.cli review\n"
         "  python -m darwaza.cli approve <request_id>\n"
-        "  python -m darwaza.cli deny <request_id>"
+        "  python -m darwaza.cli deny <request_id>\n"
+        "  python -m darwaza.cli execute <request_id>"
     )
     if len(sys.argv) < 2:
         print(usage)
@@ -161,6 +203,8 @@ def main() -> None:
         approve(sys.argv[2])
     elif command == "deny" and len(sys.argv) == 3:
         deny(sys.argv[2])
+    elif command == "execute" and len(sys.argv) == 3:
+        execute(sys.argv[2])
     else:
         print(usage)
         sys.exit(1)

@@ -707,6 +707,103 @@ deployment would need a shared counter (Redis, most likely) for this to
 mean the same thing across instances; named as designed-not-built, same
 as everywhere else this limitation applies.
 
+## 17. Approval has its own status, separate from execution — and
+    execution is retried by idempotency-by-receipt, not by a plain
+    resubmit
+
+**Chosen:** `approval_queue.py`'s `status` column gained a real state
+between "a human said yes" and "Razorpay has an order" —
+`approved_pending_execution` — instead of `resolve(approved=True)`
+writing a terminal `approved` the moment the human clicks the button,
+before `razorpay_client.create_order()` has even run. Only a
+*successful* Razorpay call, via the new `mark_executed()`, advances a
+row to the real terminal state, `executed`. A failed attempt
+(`record_execution_failure()`) leaves the row in
+`approved_pending_execution` — retryable — rather than a dead-end
+`execution_failed` status. `service.execute_approval(request_id)` is the
+new entry point that retries just the Razorpay step for a row already
+in that state, without repeating the human decision or re-claiming the
+mandate's nonce (both already happened, once, inside the original
+`authorize()` call). `razorpay_client.create_order()` itself grew a
+bounded retry loop (three attempts, short backoff) for the failures
+where retrying is actually correct — a timeout, a dropped connection, a
+Razorpay-side 5xx — and, ahead of ever calling `order.create()`, an
+idempotency-by-receipt lookup (`order.all({"receipt": ...})`) that
+returns an already-existing order for the same receipt instead of
+risking a second one. `cli.py` gained `execute <request_id>` and
+`review`'s output now lists both what's waiting on a human and what's
+approved but not yet executed; `api.py` gained
+`GET /v1/approvals/pending-execution` and
+`POST /v1/approvals/{id}/execute` (404/409/200, same mapping style as
+`approve`/`deny`).
+
+**Rejected:** Leaving `approved` as a single terminal status and telling
+an operator to "just re-run `approve`" on a stuck request (that's
+exactly the double-decision bug below); making a failed execution
+attempt a new terminal status like `execution_failed` (there's nothing
+final about "Razorpay was unreachable once" — the request should stay
+retryable, not become a dead end that needs yet another status to
+recover from); retrying inside `resolve_approval()` itself with a plain
+loop around `order.create()` and no receipt-based lookup (this is the
+duplicate-order risk named below — a lost response after a real success
+would cause a second real order on retry).
+
+**Why this was found and fixed together, not as two separate
+changes:** `tests/test_defect_hunt.py`'s D6 names the actual failure
+mode directly — a process that dies between `approval_queue.resolve()`
+committing `approved` and `razorpay_client.create_order()` returning
+leaves a row that says "approved" whether or not an order was ever
+created, with *no way to tell the two apart from queue state alone*.
+Fixing only the status (adding `approved_pending_execution` but no way
+to act on it) would make the gap visible without making it recoverable
+— an operator could see a request was stuck but still have no safe way
+to finish it, since a naive retry (call `create_order()` again with no
+idempotency guard) risks the second problem: if the *first* attempt
+actually succeeded and only its response was lost (a real timeout after
+Razorpay processed the order, not before), blindly retrying creates a
+second, duplicate order for a transaction a human only approved once.
+Both halves — a status that tells the truth, and a retry that's safe to
+call not knowing whether a prior attempt actually succeeded — are one
+fix, not two, because neither is sound without the other.
+
+**Why the idempotency key is `request_id`, not `mandate_id`:** same
+distinction decision #15 draws between `decision_id` and `request_id` —
+`request_id` is minted once, when a NEEDS_HUMAN request is first
+enqueued, and stays fixed across however many times execution is later
+retried; that fixed lifetime across retries is exactly what an
+idempotency key needs. `mandate_id` identifies the *mandate*, which
+this system's replay protection already guarantees is claimed at most
+once (Stage 3) — using it as the receipt would work today only because
+of that separate guarantee holding, which is a more fragile thing to
+depend on than a key whose entire purpose is "identifies this one
+execution attempt, stably, forever."
+
+**Why `create_order()`'s retry policy is fixed (three attempts, a short
+backoff) rather than configurable:** this is demo/test-mode traffic —
+there's no production SLA here to tune a retry budget against, and a
+named, fixed policy is honest about what's actually been exercised (see
+`tests/test_razorpay_client.py`'s Stage 6 tests) instead of exposing
+knobs nothing has validated at other settings.
+
+**Why the receipt lookup is defence-in-depth, not blind trust in
+Razorpay's filter:** `_find_existing_order()` re-checks the `receipt`
+field on whatever the lookup returns rather than assuming the API's own
+`receipt` filter parameter did the right thing unconditionally — the
+same "verify, don't just assume the query worked" caution this project
+applies to its own SQLite queries elsewhere.
+
+**What this does not claim:** Razorpay's Orders API does not itself
+enforce receipt uniqueness server-side — two concurrent callers using
+the *same* receipt for the *first* `order.create()` call (not a retry of
+an already-successful one) could still both succeed and produce two
+orders, a true create-create race rather than a create-retry race. This
+system doesn't hit that case in practice (one `request_id`, and
+therefore one receipt, is only ever driven through
+`_attempt_execution()` by `resolve_approval()`'s single initial call or
+serialized retries via `execute_approval()`), but it's not a guarantee
+Razorpay's API makes on its own — naming that honestly rather than
+overstating what the receipt lookup proves.
+
 ## Open items
 
 - **Multi-instance replay protection isn't solved** — this is
@@ -731,7 +828,18 @@ as everywhere else this limitation applies.
   0.5 as considered.
 - **Razorpay execution stops at order creation** (see decision #7) — no
   actual payment is simulated end-to-end without a frontend or a
-  separate test-payment call.
+  separate test-payment call. As of Stage 6 (decision #17), *reaching*
+  order creation reliably (retry, timeout, idempotency-by-receipt, and a
+  queue status that survives a crash mid-execution) is solved — this
+  item is now specifically about the payment round-trip past order
+  creation, not about execution being fragile.
+- **A true create-create receipt race isn't ruled out** (see decision
+  #17's "what this does not claim") — Razorpay's Orders API doesn't
+  itself enforce receipt uniqueness; this system's own call pattern
+  (one `request_id` per logical transaction, driven through
+  `_attempt_execution()` either once or via serialized retries) avoids
+  hitting it, but that's a property of how this code calls the API, not
+  a guarantee the API makes on its own.
 - **`decide_with_llm()` in buyer_agent.py is untested by the automated
   suite** — it requires a live `ANTHROPIC_API_KEY` and isn't
   reproducible enough to assert on in CI; the deterministic path is

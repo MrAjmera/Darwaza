@@ -172,7 +172,30 @@ class ApprovalAlreadyResolvedError(ValueError):
     """The request exists but isn't pending any more."""
 
     def __init__(self, request_id: str, status: str) -> None:
-        super().__init__(f"Request '{request_id}' is already {status}.")
+        readable = {
+            "approved_pending_execution": "approved (execution pending)",
+            "executed": "approved and executed",
+            "denied": "denied",
+        }.get(status, status)
+        super().__init__(f"Request '{request_id}' is already {readable}.")
+        self.request_id = request_id
+        self.status = status
+
+
+class ApprovalNotYetApprovedError(ValueError):
+    """execute_approval() was called on a request that isn't in
+    'approved_pending_execution' state — either no human has approved it
+    yet ('pending'), or it was denied. Executing a payment for either of
+    those would bypass the human decision this whole queue exists to
+    enforce, so this is refused rather than attempted. A request already
+    'executed' is handled separately, idempotently (see
+    execute_approval()) — it isn't an error, just a no-op."""
+
+    def __init__(self, request_id: str, status: str) -> None:
+        super().__init__(
+            f"Request '{request_id}' is '{status}', not approved-and-pending-execution — "
+            "nothing to execute."
+        )
         self.request_id = request_id
         self.status = status
 
@@ -180,10 +203,18 @@ class ApprovalAlreadyResolvedError(ValueError):
 class ResolutionResult:
     """Everything a caller needs to report a human's approve/deny
     decision: the audit entry it produced, and — only when approved —
-    whatever razorpay_client.create_order() returned, or why it didn't
-    run. Exactly one of razorpay_order/razorpay_error is set when
-    approved=True; both are None when approved=False (a denial never
-    attempts to create an order)."""
+    whatever the immediate Razorpay execution attempt returned, or why
+    it didn't succeed. Exactly one of razorpay_order/razorpay_error is
+    set when approved=True; both are None when approved=False (a denial
+    never attempts to create an order).
+
+    `status` reflects the approval queue row's status right after this
+    call: 'denied' when approved=False; 'executed' when the immediate
+    Razorpay attempt succeeded; 'approved_pending_execution' when it
+    didn't (see DECISIONS.md's Stage 6 entry) — in which case
+    `service.execute_approval(request_id)` is how it gets retried,
+    without repeating the human decision or re-claiming the mandate's
+    nonce."""
 
     def __init__(
         self,
@@ -195,6 +226,7 @@ class ResolutionResult:
         *,
         decision_id: str,
         approved: bool,
+        status: str,
         razorpay_order: dict | None = None,
         razorpay_error: str | None = None,
     ) -> None:
@@ -205,8 +237,71 @@ class ResolutionResult:
         self.audit_entry = audit_entry
         self.decision_id = decision_id
         self.approved = approved
+        self.status = status
         self.razorpay_order = razorpay_order
         self.razorpay_error = razorpay_error
+
+
+class ExecutionResult:
+    """What `execute_approval()` (a retry of the Razorpay step for a
+    request already approved, see below) hands back — the same
+    razorpay_order/razorpay_error shape ResolutionResult uses for its
+    own execution attempt, since it's the identical underlying
+    operation."""
+
+    def __init__(
+        self,
+        request_id: str,
+        mandate_id: str,
+        *,
+        executed: bool,
+        razorpay_order: dict | None = None,
+        razorpay_error: str | None = None,
+    ) -> None:
+        self.request_id = request_id
+        self.mandate_id = mandate_id
+        self.executed = executed
+        self.razorpay_order = razorpay_order
+        self.razorpay_error = razorpay_error
+
+
+def _attempt_execution(
+    queue: ApprovalQueue,
+    request_id: str,
+    mandate: NormalizedMandate,
+    proposed_tx: ProposedTransaction,
+) -> tuple[dict | None, str | None]:
+    """One attempt at the Razorpay side of an already-human-approved
+    request, plus the matching queue bookkeeping — shared between
+    resolve_approval()'s immediate attempt (right after a human
+    approves) and execute_approval()'s later retry, since the Razorpay
+    call and what to do with its outcome are identical in both cases;
+    only what happens *before* this call (approving vs. checking an
+    already-approved row's status) differs.
+
+    The receipt is derived from `request_id`, not `mandate_id` — see
+    DECISIONS.md #15's decision_id/request_id distinction, applied here:
+    `request_id` is what's minted once per approval request and stays
+    fixed across however many times execution is retried, which is
+    exactly the stability an idempotency key needs (razorpay_client.py's
+    own retry loop then reuses this same receipt across ITS internal
+    attempts too).
+
+    razorpay_client.create_order() already retries transient failures
+    internally with its own bounded backoff — what reaches this function
+    as an exception is either a config problem (no keys) or every
+    internal retry having been exhausted. Either way this is a caught,
+    expected outcome: the request stays 'approved_pending_execution'
+    (record_execution_failure() never changes status) rather than being
+    lost or silently marked done.
+    """
+    try:
+        order = razorpay_client.create_order(proposed_tx.amount, receipt=f"darwaza-{request_id}")
+    except RuntimeError as exc:
+        queue.record_execution_failure(request_id, error=str(exc))
+        return None, str(exc)
+    queue.mark_executed(request_id, razorpay_order_id=order["id"])
+    return order, None
 
 
 def resolve_approval(
@@ -269,17 +364,20 @@ def resolve_approval(
 
     razorpay_order = None
     razorpay_error = None
+    status = "denied"
     if approved:
         # No nonce re-claim here: this mandate was already claimed
         # inside authorize() when evaluate() first produced NEEDS_HUMAN
         # for it — a pending request in this queue is, by construction,
         # already reserved (see DECISIONS.md, D4 and Stage 3).
+        queue = ApprovalQueue(approval_db_path)
         try:
-            razorpay_order = razorpay_client.create_order(
-                proposed_tx.amount, receipt=f"darwaza-{mandate.mandate_id}"
+            razorpay_order, razorpay_error = _attempt_execution(
+                queue, request_id, mandate, proposed_tx
             )
-        except RuntimeError as exc:
-            razorpay_error = str(exc)
+        finally:
+            queue.close()
+        status = "executed" if razorpay_order is not None else "approved_pending_execution"
 
     observability.log_resolution(
         decision_id=decision_id,
@@ -299,6 +397,97 @@ def resolve_approval(
         audit_entry,
         decision_id=decision_id,
         approved=approved,
+        status=status,
+        razorpay_order=razorpay_order,
+        razorpay_error=razorpay_error,
+    )
+
+
+def list_pending_execution(
+    *, approval_db_path: Path = DEFAULT_APPROVAL_DB_PATH
+) -> list[dict]:
+    """Requests a human already approved that haven't successfully
+    reached Razorpay yet — see approval_queue.ApprovalQueue.
+    list_pending_execution(). Same "one implementation, not one per
+    caller" reasoning as list_pending_approvals()."""
+    queue = ApprovalQueue(approval_db_path)
+    try:
+        return queue.list_pending_execution()
+    finally:
+        queue.close()
+
+
+def execute_approval(
+    request_id: str,
+    *,
+    approval_db_path: Path = DEFAULT_APPROVAL_DB_PATH,
+) -> ExecutionResult:
+    """Retry the Razorpay execution step for a request a human already
+    approved. This is the recovery path for exactly the crash
+    tests/test_defect_hunt.py names: a process that died between
+    approval_queue.resolve() committing and razorpay_client.create_
+    order() succeeding used to leave that request permanently
+    indistinguishable from one that really was executed. As of Stage 6
+    it's left in 'approved_pending_execution' instead — visible via
+    list_pending_execution() — and retryable here, as many times as it
+    takes, without ever repeating the human approval step or re-claiming
+    the mandate's nonce (that happened once, inside the original
+    authorize() call, and stays claimed regardless of how many times
+    execution itself is retried).
+
+    Idempotent for the common case: a request already 'executed' returns
+    its already-stored order rather than calling Razorpay again — an
+    operator (or a retry job) can call this repeatedly without knowing
+    in advance whether a prior call already succeeded. The deeper
+    guarantee, for the rarer case of two overlapping retries actually
+    racing each other, is razorpay_client.create_order()'s own
+    idempotency-by-receipt lookup (see that module) plus
+    ApprovalQueue.mark_executed()'s atomic, status-guarded UPDATE — at
+    most one of two racing callers' mark_executed() calls can succeed,
+    which is what actually prevents a double "executed" transition, not
+    this early-return alone.
+
+    Raises `ApprovalNotFoundError` if no such request exists, or
+    `ApprovalNotYetApprovedError` if it's 'pending' (no human decision
+    yet) or 'denied' — executing either would bypass the human decision
+    this queue exists to enforce.
+    """
+    queue = ApprovalQueue(approval_db_path)
+    try:
+        row = queue.get(request_id)
+        if row is None:
+            raise ApprovalNotFoundError(request_id)
+
+        if row["status"] == "executed":
+            return ExecutionResult(
+                request_id,
+                row["mandate_id"],
+                executed=True,
+                razorpay_order={"id": row["razorpay_order_id"]},
+            )
+
+        if row["status"] != "approved_pending_execution":
+            raise ApprovalNotYetApprovedError(request_id, row["status"])
+
+        mandate = NormalizedMandate.model_validate_json(row["mandate_json"])
+        proposed_tx = ProposedTransaction.model_validate_json(row["proposed_tx_json"])
+
+        razorpay_order, razorpay_error = _attempt_execution(queue, request_id, mandate, proposed_tx)
+    finally:
+        queue.close()
+
+    observability.log_execution(
+        request_id=request_id,
+        mandate_id=mandate.mandate_id,
+        executed=razorpay_order is not None,
+        razorpay_order_id=razorpay_order.get("id") if razorpay_order else None,
+        razorpay_error=razorpay_error,
+    )
+
+    return ExecutionResult(
+        request_id,
+        mandate.mandate_id,
+        executed=razorpay_order is not None,
         razorpay_order=razorpay_order,
         razorpay_error=razorpay_error,
     )

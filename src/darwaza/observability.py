@@ -180,6 +180,34 @@ def log_resolution(
     COUNTERS.record(outcome, None if approved else "human_review_denied")
 
 
+def log_execution(
+    *,
+    request_id: str,
+    mandate_id: str,
+    executed: bool,
+    razorpay_order_id: str | None,
+    razorpay_error: str | None,
+) -> None:
+    """One structured log line for `service.execute_approval()` — a
+    *retry* of the Razorpay step for a request a human already approved
+    in an earlier, separately-logged `resolution` event (see
+    log_resolution() above). Deliberately its own event type rather than
+    another `resolution` line with `approved=True`: no human decision is
+    being made here, and reusing `resolution`'s shape would misrepresent
+    a retry as a fresh approval. Does not touch COUNTERS — the
+    ALLOW/human_review_denied counts log_resolution() already records
+    reflect the human's decision once; a retried execution attempt isn't
+    a second decision to count."""
+    _log(
+        "execution",
+        request_id=request_id,
+        mandate_id=mandate_id,
+        executed=executed,
+        razorpay_order_id=razorpay_order_id,
+        razorpay_error=razorpay_error,
+    )
+
+
 class Counters:
     """Thread-safe, in-process counts of every decision this process has
     recorded, broken down by (outcome, failed_check). Process-lifetime

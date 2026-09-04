@@ -21,6 +21,22 @@ shared with `check_same_thread=False` — sharing produced real
 `sqlite3.OperationalError`/`InterfaceError` under concurrent access
 (D3). WAL mode plus `busy_timeout` let concurrent connections coexist
 without the caller needing to retry manually.
+
+Stage 6: `status` used to go straight from 'pending' to a terminal
+'approved' the moment a human clicked approve — before
+razorpay_client.create_order() ever ran. A process that died in that gap
+left a row saying 'approved' with no way to tell, from the queue alone,
+whether the Razorpay order behind it actually got created (see
+tests/test_defect_hunt.py's `test_approved_status_does_not_distinguish_
+execution_from_a_crash`, which proves exactly this). 'approved' is no
+longer a status this module ever sets: a human's approval now produces
+'approved_pending_execution', and only a *successful* Razorpay call
+(via mark_executed()) advances it to the real terminal state,
+'executed'. A failed attempt (record_execution_failure()) leaves it in
+'approved_pending_execution' — retryable, not lost — rather than
+inventing a dead-end 'execution_failed' status: the human already said
+yes, so the system's job is to keep the request visible and retryable
+until it actually reaches Razorpay, not to give up on it.
 """
 
 from __future__ import annotations
@@ -72,12 +88,20 @@ class ApprovalQueue:
             "  proposed_tx_json TEXT NOT NULL,"
             "  reason TEXT NOT NULL,"
             "  explanation TEXT NOT NULL,"
-            "  status TEXT NOT NULL DEFAULT 'pending',"  # pending|approved|denied
+            # pending -> approved_pending_execution -> executed
+            #         -> denied (terminal)
+            # See module docstring, Stage 6, for why 'approved' alone is
+            # no longer a status this module ever sets.
+            "  status TEXT NOT NULL DEFAULT 'pending',"
             "  created_at TEXT NOT NULL,"
             "  resolved_at TEXT,"
             "  resolved_by TEXT,"
-            "  decision_id TEXT"  # Stage 5, see observability.py -- nullable,
-                                   # same reasoning as audit_log.py's decision_id.
+            "  decision_id TEXT,"  # Stage 5, see observability.py -- nullable,
+                                    # same reasoning as audit_log.py's decision_id.
+            "  razorpay_order_id TEXT,"  # Stage 6 -- set only by mark_executed().
+            "  execution_attempts INTEGER NOT NULL DEFAULT 0,"  # Stage 6
+            "  last_execution_error TEXT,"  # Stage 6 -- most recent failure, if any.
+            "  executed_at TEXT"  # Stage 6
             ")"
         )
         conn.commit()
@@ -140,7 +164,8 @@ class ApprovalQueue:
 
     def get(self, request_id: str) -> dict | None:
         row = self._connection().execute(
-            "SELECT id, mandate_id, mandate_json, proposed_tx_json, reason, explanation, status, decision_id "
+            "SELECT id, mandate_id, mandate_json, proposed_tx_json, reason, explanation, status, "
+            "decision_id, razorpay_order_id, execution_attempts, last_execution_error "
             "FROM pending_approvals WHERE id = ?",
             (request_id,),
         ).fetchone()
@@ -155,10 +180,19 @@ class ApprovalQueue:
             "explanation": row[5],
             "status": row[6],
             "decision_id": row[7],
+            "razorpay_order_id": row[8],
+            "execution_attempts": row[9],
+            "last_execution_error": row[10],
         }
 
     def resolve(self, request_id: str, *, approved: bool, resolved_by: str = "human") -> None:
-        status = "approved" if approved else "denied"
+        """Record a human's approve/deny decision. Approval no longer
+        lands on a terminal status here — see the module docstring
+        (Stage 6) for why 'approved_pending_execution' exists instead of
+        'approved': execution against Razorpay hasn't happened yet, and
+        this call alone must not claim that it has. Only mark_executed()
+        (below) ever sets 'executed'."""
+        status = "approved_pending_execution" if approved else "denied"
         conn = self._connection()
         cur = conn.execute(
             "UPDATE pending_approvals SET status = ?, resolved_at = ?, resolved_by = ? "
@@ -171,6 +205,74 @@ class ApprovalQueue:
                 f"No *pending* approval with id '{request_id}' "
                 "(already resolved, or the id doesn't exist)."
             )
+
+    def mark_executed(self, request_id: str, *, razorpay_order_id: str) -> None:
+        """Advance a request from 'approved_pending_execution' to the
+        real terminal state, 'executed' — called only once
+        razorpay_client.create_order() has actually returned an order (a
+        genuinely new one, or an existing one found via its own
+        idempotency-by-receipt lookup — either way, a definite,
+        already-confirmed result). Guarded to the same 'only from this
+        exact prior status' pattern as resolve(): a row that's already
+        'executed', or that's still 'pending'/'denied', can't be marked
+        executed out from under itself, which matters because this is
+        exactly the operation service.execute_approval() may call
+        multiple times if a retry raced with an earlier attempt's
+        success."""
+        conn = self._connection()
+        cur = conn.execute(
+            "UPDATE pending_approvals SET status = 'executed', razorpay_order_id = ?, executed_at = ? "
+            "WHERE id = ? AND status = 'approved_pending_execution'",
+            (razorpay_order_id, datetime.now(timezone.utc).isoformat(), request_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise ValueError(
+                f"No request '{request_id}' in 'approved_pending_execution' state "
+                "(already executed, still pending human review, or denied)."
+            )
+
+    def record_execution_failure(self, request_id: str, *, error: str) -> None:
+        """Record a failed (or exhausted-retries) execution attempt
+        *without* changing status — the request stays
+        'approved_pending_execution' (see module docstring: execution is
+        retryable by design, there is no dead-end 'failed' status) but
+        the queue remembers how many attempts have been made and what
+        the last error was, so `review`/`GET /v1/approvals/pending-
+        execution` output can tell a fresh, never-attempted approval
+        apart from one that's already failed N times."""
+        conn = self._connection()
+        conn.execute(
+            "UPDATE pending_approvals SET execution_attempts = execution_attempts + 1, "
+            "last_execution_error = ? WHERE id = ? AND status = 'approved_pending_execution'",
+            (error, request_id),
+        )
+        conn.commit()
+
+    def list_pending_execution(self) -> list[dict]:
+        """Requests a human already approved that haven't successfully
+        reached Razorpay yet — never attempted, or attempted and failed.
+        This is what makes the 'approved, not yet executed' state
+        visible and actionable (the gap test_defect_hunt.py's crash
+        scenario proved was previously invisible) instead of silently
+        stuck forever."""
+        rows = self._connection().execute(
+            "SELECT id, mandate_id, reason, created_at, decision_id, execution_attempts, "
+            "last_execution_error FROM pending_approvals "
+            "WHERE status = 'approved_pending_execution' ORDER BY created_at"
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "mandate_id": r[1],
+                "reason": r[2],
+                "created_at": r[3],
+                "decision_id": r[4],
+                "execution_attempts": r[5],
+                "last_execution_error": r[6],
+            }
+            for r in rows
+        ]
 
     def close(self) -> None:
         """Close every connection this queue opened, across every thread

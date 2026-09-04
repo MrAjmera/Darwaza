@@ -234,6 +234,89 @@ def test_approve_twice_returns_409_second_time(client):
 
 
 # ---------------------------------------------------------------------------
+# GET /v1/approvals/pending-execution, POST /v1/approvals/{id}/execute
+# (Stage 6 — retrying execution for a request already approved but not
+# yet executed against Razorpay)
+# ---------------------------------------------------------------------------
+
+
+def test_approved_request_appears_in_pending_execution_not_approvals(client):
+    mandate = _signed_mandate_dict("api-pending-exec-1", max_amount=1000.0)
+    proposed_tx = {"merchant_id": "merchant-a", "amount": 800.0, "category": "electronics"}
+    authorize_response = client.post(
+        "/v1/authorize", json={"mandate": mandate, "proposed_tx": proposed_tx}
+    )
+    request_id = authorize_response.json()["request_id"]
+
+    # No Razorpay keys configured in this test env, so approve() cannot
+    # actually execute -- the row must land in pending-execution, not
+    # silently disappear.
+    client.post(f"/v1/approvals/{request_id}/approve")
+
+    pending_execution = client.get("/v1/approvals/pending-execution").json()
+    ids = [row["id"] for row in pending_execution]
+    assert request_id in ids
+
+    still_pending = client.get("/v1/approvals").json()
+    assert request_id not in [row["id"] for row in still_pending]
+
+
+def test_execute_retries_and_reports_the_same_missing_key_error(client):
+    mandate = _signed_mandate_dict("api-execute-retry-1", max_amount=1000.0)
+    proposed_tx = {"merchant_id": "merchant-a", "amount": 800.0, "category": "electronics"}
+    authorize_response = client.post(
+        "/v1/authorize", json={"mandate": mandate, "proposed_tx": proposed_tx}
+    )
+    request_id = authorize_response.json()["request_id"]
+    client.post(f"/v1/approvals/{request_id}/approve")
+
+    response = client.post(f"/v1/approvals/{request_id}/execute")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["executed"] is False
+    assert body["razorpay_order"] is None
+    assert body["razorpay_error"] is not None
+
+    # Still retryable -- unaffected by the failed attempt above.
+    pending_execution = client.get("/v1/approvals/pending-execution").json()
+    assert request_id in [row["id"] for row in pending_execution]
+
+
+def test_execute_unknown_id_returns_404(client):
+    response = client.post("/v1/approvals/does-not-exist/execute")
+    assert response.status_code == 404
+
+
+def test_execute_on_a_still_pending_request_returns_409(client):
+    mandate = _signed_mandate_dict("api-execute-not-approved-1", max_amount=1000.0)
+    proposed_tx = {"merchant_id": "merchant-a", "amount": 800.0, "category": "electronics"}
+    authorize_response = client.post(
+        "/v1/authorize", json={"mandate": mandate, "proposed_tx": proposed_tx}
+    )
+    request_id = authorize_response.json()["request_id"]
+
+    # No approve()/deny() call -- a human hasn't decided this yet.
+    response = client.post(f"/v1/approvals/{request_id}/execute")
+
+    assert response.status_code == 409
+
+
+def test_execute_on_a_denied_request_returns_409(client):
+    mandate = _signed_mandate_dict("api-execute-denied-1", max_amount=1000.0)
+    proposed_tx = {"merchant_id": "merchant-a", "amount": 800.0, "category": "electronics"}
+    authorize_response = client.post(
+        "/v1/authorize", json={"mandate": mandate, "proposed_tx": proposed_tx}
+    )
+    request_id = authorize_response.json()["request_id"]
+    client.post(f"/v1/approvals/{request_id}/deny")
+
+    response = client.post(f"/v1/approvals/{request_id}/execute")
+
+    assert response.status_code == 409
+
+
+# ---------------------------------------------------------------------------
 # GET /healthz, GET /metrics
 # ---------------------------------------------------------------------------
 

@@ -212,6 +212,16 @@ def list_approvals(approval_db_path: Path = Depends(_approval_db_path)) -> list[
     return service.list_pending_approvals(approval_db_path=approval_db_path)
 
 
+@app.get("/v1/approvals/pending-execution")
+def list_pending_execution(approval_db_path: Path = Depends(_approval_db_path)) -> list[dict]:
+    """Requests a human already approved (POST .../approve) that haven't
+    successfully reached Razorpay yet — see DECISIONS.md's Stage 6 entry
+    and approval_queue.py. A distinct list from GET /v1/approvals, which
+    is only requests still waiting on a human decision in the first
+    place; these two states are never the same row at the same time."""
+    return service.list_pending_execution(approval_db_path=approval_db_path)
+
+
 def _resolve(
     request_id: str,
     *,
@@ -256,6 +266,38 @@ def deny_request(
     approval_db_path: Path = Depends(_approval_db_path),
 ) -> JSONResponse:
     return _resolve(request_id, approved=False, log_path=log_path, approval_db_path=approval_db_path)
+
+
+@app.post("/v1/approvals/{request_id}/execute")
+def execute_request(
+    request_id: str,
+    approval_db_path: Path = Depends(_approval_db_path),
+) -> JSONResponse:
+    """Retry the Razorpay execution step for a request already approved
+    — see service.execute_approval() and DECISIONS.md's Stage 6 entry.
+    404 (unknown id) and 409 (never approved, or denied) mirror
+    approve/deny's own error mapping; a request that's already
+    'executed' is not an error here — it returns 200 with the
+    already-stored order (idempotent), same as a fresh success."""
+    try:
+        result = service.execute_approval(request_id, approval_db_path=approval_db_path)
+    except service.ApprovalNotFoundError as exc:
+        return JSONResponse(status_code=404, content={"error": "not_found", "detail": str(exc)})
+    except service.ApprovalNotYetApprovedError as exc:
+        return JSONResponse(
+            status_code=409, content={"error": "not_approved_pending_execution", "detail": str(exc)}
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "request_id": result.request_id,
+            "mandate_id": result.mandate_id,
+            "executed": result.executed,
+            "razorpay_order": result.razorpay_order,
+            "razorpay_error": result.razorpay_error,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

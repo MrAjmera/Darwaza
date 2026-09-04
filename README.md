@@ -17,8 +17,11 @@ LLM calls in the enforcement path), real Ed25519 signature verification,
 persistent SQLite-backed replay detection, a hash-chained tamper-evident
 audit log, a buyer-agent simulator with a real (not just unit-tested)
 poisoned-catalog attack, an LLM explainer that is structurally unable to
-influence a decision, a human approval queue, and Razorpay test-mode
-order creation.
+influence a decision, a human approval queue whose "approved" and
+"executed" are two separately-tracked states (not one that quietly means
+both), and Razorpay test-mode order creation with real
+retry/timeout/idempotency-by-receipt behavior so a transient failure is
+retryable rather than lost.
 
 **Explicitly out of scope**, named directly rather than hidden: key
 management/rotation (one hardcoded demo keypair stands in for every
@@ -75,6 +78,11 @@ python -m darwaza.cli simulate needs-human        # NEEDS_HUMAN — a legitimate
 # Human approval flow, for a NEEDS_HUMAN result
 python -m darwaza.cli review
 python -m darwaza.cli approve <request_id>   # or: deny <request_id>
+
+# If approval succeeded but execution against Razorpay didn't (no keys
+# configured, or a transient failure) -- retry just that step, as many
+# times as it takes, without repeating the human decision:
+python -m darwaza.cli execute <request_id>
 ```
 
 Set `ANTHROPIC_API_KEY` before `simulate needs-human` to get a real LLM
@@ -106,5 +114,11 @@ python -m pytest
 - `test_llm_explainer.py`, `test_razorpay_client.py` — the two
   optional-dependency integrations, tested against their fallback /
   fail-loudly behavior (no live API calls in the automated suite).
+  `test_razorpay_client.py`'s retry/timeout/idempotency-by-receipt tests
+  run against a fake `razorpay.Client` (skipped, not failing, if
+  `razorpay` isn't installed at all).
+- `test_service_execution.py` — the "approved but not yet executed"
+  retry path: `execute_approval()`'s idempotency, its 404/409 error
+  mapping, and `resolve_approval()`'s `status` field.
 - `test_cli_approval_flow.py` — the CLI itself, run as a real
   subprocess, through `simulate` → `review` → `approve`.

@@ -2,8 +2,10 @@
 of bugs as D1-D4 (TOCTOU races, and states that don't say what they mean).
 
 D5 (amount validity) is fixed as of this file's current version -- see
-DECISIONS.md #8 and policy_engine.py / schema.py. The other findings
-below remain open (proven, not yet fixed).
+DECISIONS.md #8 and policy_engine.py / schema.py. D6 (approved/executed
+conflation, below) is fixed as of Stage 6 -- see DECISIONS.md's Stage 6
+entry and approval_queue.py/service.py's 'approved_pending_execution'
+status.
 
 Found, and ruled out (kept here as a record, not as failing tests):
 - keys.verify() on malformed/truncated/wrong-length signatures: does NOT
@@ -132,20 +134,22 @@ def test_append_entry_recovers_from_a_prior_partial_write(tmp_path):
     append_entry(log_path, "m2", Decision(outcome=Outcome.ALLOW, reason="ok", failed_check=None))
 
 
-def test_approved_status_does_not_distinguish_execution_from_a_crash(tmp_path):
-    """approval_queue.resolve() commits status='approved' *before*
-    razorpay_client.create_order() is ever called (see cli.py's
-    _resolve()). If the process dies between that commit and the Razorpay
-    call, the row is left in 'approved' state forever -- identical to a
-    row where the order really was created. There is currently no way to
-    tell, from the queue alone, whether an approved request still needs to
-    be executed.
+def test_D6_approved_status_does_not_distinguish_execution_from_a_crash(tmp_path):
+    """approval_queue.resolve() used to commit status='approved' *before*
+    razorpay_client.create_order() was ever called. If the process died
+    between that commit and the Razorpay call, the row was left in
+    'approved' state forever -- identical to a row where the order
+    really was created, with no way to tell the two apart from queue
+    state alone.
 
-    This test stands in for that crash: it resolves a request as approved
-    and never calls Razorpay (exactly the state a crash right after
-    resolve() would leave behind), then asserts the queue's own state
-    records that execution has not happened. Today 'approved' is a
-    terminal status, so it can't."""
+    This test stands in for that crash: it resolves a request as
+    approved and never calls Razorpay (exactly the state a crash right
+    after resolve() would leave behind), then asserts the queue's own
+    state records that execution has not happened. As of Stage 6,
+    resolve(approved=True) lands on 'approved_pending_execution', not
+    'approved' -- see test_D6_execute_approval_recovers_from_exactly_
+    that_crash below for proof the *recovery* path works too, not just
+    that the status now says the truth."""
     queue = ApprovalQueue(tmp_path / "approvals.db")
     mandate = _signed_ap2_mandate("crash-between-resolve-and-pay")
     tx = ProposedTransaction(merchant_id="m1", amount=800.0, category="electronics")
@@ -165,3 +169,39 @@ def test_approved_status_does_not_distinguish_execution_from_a_crash(tmp_path):
         "between resolve() and the Razorpay call is unrecoverable and "
         "undetectable from queue state alone"
     )
+    assert row["status"] == "approved_pending_execution"
+
+
+def test_D6_execute_approval_recovers_from_exactly_that_crash(tmp_path, monkeypatch):
+    """Companion to the test above: proves the row left behind by a
+    crash between resolve() and create_order() is not just correctly
+    *labeled* but actually *recoverable* -- service.execute_approval()
+    must be able to finish the job later without repeating the human
+    decision or touching the nonce store again."""
+    from darwaza import service
+    from darwaza import razorpay_client
+
+    approval_db_path = tmp_path / "approvals.db"
+    queue = ApprovalQueue(approval_db_path)
+    mandate = _signed_ap2_mandate("crash-recovery-1")
+    tx = ProposedTransaction(merchant_id="m1", amount=800.0, category="electronics")
+    decision = Decision(
+        outcome=Outcome.NEEDS_HUMAN, reason="t", failed_check="human_review_threshold"
+    )
+    request_id = queue.enqueue(mandate, tx, decision, "explanation")
+    queue.resolve(request_id, approved=True)  # crash simulated: never reaches Razorpay
+    queue.close()
+
+    monkeypatch.setattr(
+        razorpay_client, "create_order", lambda *a, **k: {"id": "order_recovered"}
+    )
+
+    result = service.execute_approval(request_id, approval_db_path=approval_db_path)
+
+    assert result.executed is True
+    assert result.razorpay_order["id"] == "order_recovered"
+
+    queue = ApprovalQueue(approval_db_path)
+    row = queue.get(request_id)
+    queue.close()
+    assert row["status"] == "executed"
