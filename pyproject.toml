@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "darwaza"
+version = "0.1.0"
+description = "Protocol-agnostic, merchant-side authorization gateway for AI buying agents."
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic==2.9.2",
+    "cryptography==43.0.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

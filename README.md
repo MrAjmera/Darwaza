@@ -41,7 +41,16 @@ venv\Scripts\activate
 source venv/bin/activate
 
 pip install -r requirements.txt
+pip install -e .
 ```
+
+The `pip install -e .` step (using `pyproject.toml`) is what makes
+`python -m darwaza.cli ...` work directly. Without it, only `pytest`
+would work (it separately gets `src` on its path via `pythonpath = src`
+in `pytest.ini`) — the CLI itself would raise
+`ModuleNotFoundError: No module named 'darwaza'`. Re-run this any time
+after pulling new changes; you don't need to repeat it otherwise, since
+it's an editable install (`-e`) that just points at `src/` directly.
 
 Optional, only if you want the live paths (both are lazily imported —
 nothing else needs them):
