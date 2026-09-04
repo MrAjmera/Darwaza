@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          # razorpay==1.4.2 is optional at runtime (config.py/README) but
+          # exercises real retry/idempotency logic in
+          # tests/test_razorpay_client.py when installed (see DECISIONS.md
+          # Stage 6) -- installed here so CI proves that logic, not just
+          # its no-keys fallback. setuptools<81 works around razorpay
+          # 1.4.2 still importing pkg_resources, removed in newer
+          # setuptools (a razorpay-SDK issue, unrelated to this project).
+          pip install "setuptools<81" razorpay==1.4.2
+      - name: Run pytest
+        run: python -m pytest -q
+      - name: Run evals
+        run: python evals/run.py
