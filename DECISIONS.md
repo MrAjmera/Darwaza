@@ -201,6 +201,110 @@ recording that a human made a decision. A dispute reconstruction reads
 both lines and sees exactly what the deterministic engine flagged and
 exactly what a human then decided, with a timestamp and reason for each.
 
+## 8. Amount validity is checked before the signature, and `isfinite()` is
+   used instead of a plain `<= 0` guard
+
+**Chosen:** `evaluate()` now begins with a check that
+`proposed_tx.amount` is a positive, finite number
+(`math.isfinite(amount) and amount > 0`), placed *before* signature
+verification, and `ProposedTransaction.amount` also carries a matching
+Pydantic constraint (`gt=0, allow_inf_nan=False`) at the schema level.
+
+**Rejected:** A single `if amount <= 0: deny` guard, and/or relying on
+the schema constraint alone without a corresponding check inside
+`evaluate()`.
+
+**Why this was a real defect, not a hypothetical one:** neither check e.
+(amount cap: `amount > max_amount`) nor check g. (human review:
+`amount > 0.5 * max_amount`) ever expressed a lower bound. A spend cap
+written as "not more than X" only bounds one direction — nothing in the
+model ever stated that money is assumed to flow from principal to
+merchant. Verified directly against the running code: `0.0`, `-1000.0`,
+`-999999.0`, and `float('nan')` all returned `ALLOW` against a mandate
+with `max_amount=1000.0`; only `float('inf')` was (incidentally) caught,
+by the `>` in check e. `float('-inf')` also passed as `ALLOW` — it's
+less than any finite cap and less than half of one.
+
+**Why `<= 0` alone is not a sufficient fix:** NaN is unordered by
+definition — every comparison against NaN except `!=` returns `False`,
+including `nan <= 0`. A guard written as `if amount <= 0: deny` silently
+never fires for NaN, which is the exact mechanism that let it slip past
+checks e. and g. in the first place. `math.isfinite()` rejects NaN and
+both infinities explicitly, by construction, rather than by relying on
+comparison semantics that happen to work for ordinary numbers.
+
+**Why this check runs before check a. (signature) rather than after
+it:** every other check in this function reads a field from the
+*mandate*, which is exactly why signature verification has to run
+first — DECISIONS.md's original ordering rationale ("every later check
+is reading fields from a document we haven't confirmed the principal
+actually signed") is about the mandate, not about `proposed_tx`.
+`proposed_tx` was never signed by anyone; it's the buyer agent's own
+live claim about what it wants to buy right now, not part of what the
+principal authorized. Confirming its shape is sane doesn't require
+trusting the mandate at all, so there is no reason to spend an Ed25519
+verification on a request whose amount isn't even a real number.
+
+**Why both the schema constraint and the `evaluate()` check exist, when
+either one alone would stop most of this:** the Pydantic constraint on
+`ProposedTransaction.amount` stops an invalid value from ever becoming a
+constructed object anywhere in the system — including in code that
+doesn't route through `evaluate()` at all, like a future HTTP API layer
+deserializing a request body. But `evaluate()` cannot assume every
+caller went through normal Pydantic construction: `buyer_agent.py` and
+`simulate.py` build `ProposedTransaction` values directly in Python, a
+future caller could use `model_construct()` to skip validation
+deliberately (tests use exactly this to exercise the `evaluate()`-level
+check in isolation), and `evaluate()` is meant to be a self-contained,
+trustworthy gate regardless of what already validated its inputs
+upstream. Defence in depth here means neither layer is allowed to be
+"the one that actually does it."
+
+## 9. NEEDS_HUMAN reserves the nonce; denial leaves it spent
+
+**Chosen:** the nonce is now marked spent the moment a mandate reaches
+NEEDS_HUMAN, not only once a human later approves it (`cli.py`'s
+`decide()` and `simulate.py`'s `_run()` both changed from
+`if outcome == ALLOW` to `if outcome in (ALLOW, NEEDS_HUMAN)`). If a
+human later denies the request, the reservation is *not* released — the
+mandate stays spent. This is deliberate, not an oversight: there is no
+code path anywhere that removes a mandate_id from the nonce store once
+added, for either outcome.
+
+**Rejected:** releasing the reservation on denial (so a denied mandate
+could be resubmitted), or reserving only a "soft hold" distinct from a
+full spend that a human could reverse.
+
+**Why reserve at NEEDS_HUMAN instead of waiting for the human's
+decision:** a mandate that reaches NEEDS_HUMAN is already spoken for —
+it is sitting in a queue, on its way to a real decision. Leaving it
+claimable in the meantime means the same single-use mandate can produce
+any number of separate pending approvals (reproduced directly: three
+`simulate needs-human` calls against the same mandate_id produced three
+independent queue rows, each independently approvable, i.e. three
+Razorpay orders from one authorization). The nonce isn't "spent" in the
+sense of money having moved — it's spent in the sense that this mandate
+has already committed to one outcome-in-progress, and a second,
+concurrent claim on the same mandate is never legitimate regardless of
+how the first one resolves.
+
+**Why a denial doesn't un-spend it (fail closed):** the alternative —
+releasing the nonce so the same mandate can be resubmitted after a
+human denial — would mean a denial is not actually a denial, just a
+delay until someone tries again (or an attacker retries automatically).
+A human explicitly declining a transaction should be the end of that
+mandate's story, not a retry prompt. If the principal genuinely wants to
+authorize the same purchase again, that requires a new mandate with a
+new `mandate_id` — cheap to obtain from the principal in a real flow,
+and the correct place for a second, independent decision to be made.
+
+**What this does not yet fix:** reservation still happens via the
+non-atomic check-then-add pattern (`evaluate()` checks membership,
+the caller calls `.add()` afterward) — this closes the *sequential*
+version of D4 (proven by three separate CLI invocations, one after
+another) but not the concurrent version, which is Stage 3's
+`NonceStore.claim()` fix.
+
 ## Open items
 
 - **Multi-instance replay protection isn't solved.** A single SQLite

@@ -64,16 +64,21 @@ def test_D4_needs_human_reserves_nonce_so_it_cannot_be_resubmitted(tmp_path):
 
 
 def test_D4_only_one_of_the_duplicate_approvals_can_be_approved(tmp_path):
-    """The sharper consequence of D4: not just duplicate queue rows, but
-    each is independently approvable today -- three separate 'APPROVED'
-    resolutions (and, with real Razorpay keys, three real orders) for one
-    authorization that should only ever be spendable once."""
+    """The sharper consequence of D4: before the nonce-reservation fix,
+    not just duplicate queue rows are created, but each is independently
+    approvable -- three separate 'APPROVED' resolutions (and, with real
+    Razorpay keys, three real orders) for one authorization that should
+    only ever be spendable once. After the fix, only the first
+    submission ever reaches NEEDS_HUMAN at all (the second and third are
+    denied as replays before enqueueing), so this collects whatever
+    request ids actually got created and asserts on how many of *those*
+    end up approved -- correct either way the queue got populated."""
     request_ids = []
     for _ in range(3):
         result = _run_cli(["simulate", "needs-human"], cwd=tmp_path)
         match = re.search(r"request id: (\S+)", result.stdout)
-        assert match, result.stdout
-        request_ids.append(match.group(1))
+        if match:
+            request_ids.append(match.group(1))
 
     approved_count = 0
     for rid in request_ids:
@@ -82,8 +87,8 @@ def test_D4_only_one_of_the_duplicate_approvals_can_be_approved(tmp_path):
             approved_count += 1
 
     assert approved_count == 1, (
-        f"expected only 1 of the {len(request_ids)} duplicate approval "
-        f"requests for a single-use mandate to be approvable, but "
+        f"expected exactly 1 of the {len(request_ids)} queued request(s) "
+        f"for this single-use mandate to be approvable, but "
         f"{approved_count} were approved -- one authorization would "
         f"produce {approved_count} Razorpay orders"
     )

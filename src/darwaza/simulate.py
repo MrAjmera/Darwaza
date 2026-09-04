@@ -64,7 +64,10 @@ def _run(
     store = NonceStore(nonce_db_path)
     try:
         decision = evaluate(mandate, proposed_tx, store)
-        if decision.outcome.value == "ALLOW":
+        if decision.outcome.value in ("ALLOW", "NEEDS_HUMAN"):
+            # Reserve on NEEDS_HUMAN too, not only ALLOW — a mandate
+            # flagged for human review is already spoken for. See
+            # cli.py's decide() for the same fix and DECISIONS.md (D4).
             store.add(mandate.mandate_id)
     finally:
         store.close()

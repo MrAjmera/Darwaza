@@ -1,6 +1,9 @@
 """Further defects found while auditing the codebase for the same family
 of bugs as D1-D4 (TOCTOU races, and states that don't say what they mean).
-Each test proves one gap against the current code; none are fixed here.
+
+D5 (amount validity) is fixed as of this file's current version -- see
+DECISIONS.md #8 and policy_engine.py / schema.py. The other findings
+below remain open (proven, not yet fixed).
 
 Found, and ruled out (kept here as a record, not as failing tests):
 - keys.verify() on malformed/truncated/wrong-length signatures: does NOT
@@ -18,6 +21,9 @@ Found, and ruled out (kept here as a record, not as failing tests):
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+
+import pytest
+from pydantic import ValidationError
 
 from darwaza import keys
 from darwaza.approval_queue import ApprovalQueue
@@ -43,24 +49,50 @@ def _signed_ap2_mandate(mandate_id: str, **overrides) -> NormalizedMandate:
     return m.model_copy(update={"signature": keys.sign(m.signing_payload())})
 
 
-def test_negative_amount_bypasses_amount_cap_and_review_threshold():
-    """proposed_tx.amount has no lower bound anywhere in the schema or in
-    evaluate(). A negative amount is not a purchase (it's a credit
-    someone is trying to push through the gate as if it were one), but it
-    structurally satisfies check e. (it's <= max_amount) and check g.
-    (it's not > half of max_amount), so it sails through as an ordinary
-    ALLOW -- a fraudulent negative-amount transaction is *harder* to
-    catch than a legitimate one, not easier."""
-    mandate = _signed_ap2_mandate("neg-amount-1", max_amount=1000.0)
-    tx = ProposedTransaction(merchant_id="m1", amount=-500.0, category="electronics")
+# D5: proposed_tx.amount had no lower bound anywhere -- neither the
+# schema nor evaluate() ever expressed "money flows from principal to
+# merchant." Verified independently against the running code: 0.0,
+# -1000.0, -999999.0, float('nan'), and float('-inf') ALL returned ALLOW
+# against an AP2 mandate with max_amount=1000.0. Only float('inf') was
+# (incidentally) denied, by check e.'s `>` comparison. NaN is the sharp
+# case: it's unordered, so a naive `if amount <= 0: deny` guard would
+# silently never fire for it -- `math.isfinite()` is required, not a
+# comparison. See DECISIONS.md #8.
+D5_INVALID_AMOUNTS = [0.0, -1000.0, -999999.0, float("nan"), float("-inf"), float("inf")]
+D5_INVALID_AMOUNT_IDS = ["zero", "negative", "large-negative", "nan", "neg-inf", "pos-inf"]
+
+
+@pytest.mark.parametrize("amount", D5_INVALID_AMOUNTS, ids=D5_INVALID_AMOUNT_IDS)
+def test_D5_schema_rejects_non_finite_or_non_positive_amount(amount):
+    """Defence-in-depth layer 1: ProposedTransaction itself should refuse
+    to construct with an invalid amount, so no code path anywhere in the
+    system -- including a future HTTP API deserializing a request body --
+    can end up holding one."""
+    with pytest.raises(ValidationError):
+        ProposedTransaction(merchant_id="m1", amount=amount, category="electronics")
+
+
+@pytest.mark.parametrize("amount", D5_INVALID_AMOUNTS, ids=D5_INVALID_AMOUNT_IDS)
+def test_D5_evaluate_denies_non_finite_or_non_positive_amount(amount):
+    """Defence-in-depth layer 2: evaluate() must not trust that every
+    ProposedTransaction it's handed went through normal Pydantic
+    validation -- buyer_agent.py and simulate.py construct these directly
+    in Python, and a caller can always reach for model_construct() to
+    skip validation outright (used here deliberately, to prove this
+    layer catches what the schema layer might not see). An invalid
+    amount must DENY with failed_check="invalid_amount", not fall through
+    to check e. (amount cap) or check g. (human review threshold), both
+    of which a non-finite or non-positive number can satisfy by
+    accident."""
+    mandate = _signed_ap2_mandate("d5-invalid-amount", max_amount=1000.0)
+    tx = ProposedTransaction.model_construct(
+        merchant_id="m1", amount=amount, category="electronics"
+    )
 
     result = evaluate(mandate, tx, set())
 
-    assert result.outcome != Outcome.ALLOW, (
-        "a negative transaction amount should never auto-allow -- it "
-        "currently does, bypassing both the amount cap and the human "
-        "review threshold checks entirely"
-    )
+    assert result.outcome == Outcome.DENY
+    assert result.failed_check == "invalid_amount"
 
 
 def test_verify_chain_reports_corruption_instead_of_crashing(tmp_path):

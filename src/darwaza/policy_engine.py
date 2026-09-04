@@ -5,6 +5,7 @@ explainable by exact rule, not by a model's judgment.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Protocol
 
@@ -66,6 +67,25 @@ def evaluate(
     that happens strictly after this function returns, never inside it
     (DECISIONS.md #2).
     """
+
+    # Amount validity comes before check a., not after it. proposed_tx is
+    # not part of the signed mandate — it's the buyer agent's own claim
+    # about what it wants to buy — so confirming its shape doesn't require
+    # trusting anything the signature proves, and there's no reason to do
+    # the signature's public-key crypto on a request whose amount isn't
+    # even a sane number. `proposed_tx.amount <= 0` alone is NOT a
+    # sufficient guard: NaN is unordered, so `nan <= 0` is False and the
+    # guard silently never fires — which is exactly how NaN (and 0.0 and
+    # every negative amount) previously reached check e. and check g.
+    # and satisfied both "not over the cap" and "not over the human-review
+    # threshold" at once. `math.isfinite()` rejects NaN and +/-inf
+    # explicitly, closing that gap. See DECISIONS.md.
+    if not math.isfinite(proposed_tx.amount) or proposed_tx.amount <= 0:
+        return Decision(
+            outcome=Outcome.DENY,
+            reason=f"Transaction amount {proposed_tx.amount} is not a valid positive amount.",
+            failed_check="invalid_amount",
+        )
 
     # a. Signature must be valid, or nothing else about the mandate can be
     #    trusted — every later check is reading fields from a document we

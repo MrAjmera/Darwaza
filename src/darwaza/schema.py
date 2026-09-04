@@ -10,7 +10,7 @@ import json
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ProposedTransaction(BaseModel):
@@ -19,10 +19,20 @@ class ProposedTransaction(BaseModel):
     This is what gets checked *against* a mandate — it is not part of the
     mandate itself. It always carries a concrete merchant, amount, and
     category, regardless of which protocol produced the mandate.
+
+    `amount` is constrained to a positive, finite number (gt=0,
+    allow_inf_nan=False) as defence in depth: a spend cap expressed as
+    `amount > max_amount` only bounds one direction, and nothing in the
+    model ever stated that money flows one way, so zero, negative, NaN,
+    and +/-inf amounts all satisfied "not greater than the cap" before
+    this constraint existed. See DECISIONS.md and
+    policy_engine.evaluate()'s own amount-validity check, which exists
+    for the same reason but cannot be replaced by this one — see there
+    for why both layers are needed.
     """
 
     merchant_id: str
-    amount: float
+    amount: float = Field(gt=0, allow_inf_nan=False)
     category: str | None = None
 
 

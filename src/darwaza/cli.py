@@ -82,7 +82,11 @@ def decide(mandate_path: str, tx_path: str) -> None:
     proposed_tx = ProposedTransaction.model_validate(_load(tx_path))
 
     decision = evaluate(mandate, proposed_tx, _SEEN_NONCES)
-    if decision.outcome == Outcome.ALLOW:
+    if decision.outcome in (Outcome.ALLOW, Outcome.NEEDS_HUMAN):
+        # A NEEDS_HUMAN mandate is spoken for the moment it's flagged, not
+        # only once a human eventually approves it — otherwise it stays
+        # claimable and can be resubmitted for as many separate pending
+        # approvals as someone cares to create. See DECISIONS.md (D4).
         _SEEN_NONCES.add(mandate.mandate_id)
 
     _handle_result(mandate, proposed_tx, decision)
