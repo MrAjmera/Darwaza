@@ -470,6 +470,47 @@ loses a brief lock race wait and retry instead of raising
 concurrent threads each getting their own connection actually succeed,
 rather than just fail with a *different*, more honest-looking error.
 
+## 13. One service layer, two entry points — the CLI stays, it doesn't
+    get replaced by the HTTP API
+
+**Chosen:** `service.py` holds every operation that used to be
+duplicated between `cli.decide()`/`cli.simulate()` (`authorize()`) and,
+as of this stage, between what would otherwise have become duplicated
+`approve`/`deny`/`review` handlers in `cli.py` and `api.py`
+(`resolve_approval()`, `list_pending_approvals()`). Both `cli.py` (a
+human at a terminal) and `api.py` (a buying agent over HTTP, added this
+stage) call into `service.py` and do nothing else with the policy
+engine, the nonce store, the audit log, the explainer, or the approval
+queue directly — `cli.py` is now pure presentation: load input, call a
+`service.py` function, print whatever comes back.
+
+**Rejected:** Building the HTTP API as the primary interface and
+demoting or removing the CLI; or building `api.py` as a second,
+independent implementation of "evaluate -> claim -> log -> explain ->
+enqueue" and "resolve -> log -> execute" that happens to produce
+similar results to the CLI's.
+
+**Why the CLI doesn't go away:** a buying agent is a machine on a
+network — it needs a network interface, which is what `api.py` is for.
+A human reviewing a NEEDS_HUMAN request and typing `approve <id>` is a
+person making a judgment call at a terminal, which is what a CLI is
+for and an HTTP API is not a more "modern" replacement for. These are
+different consumers with different reasons to exist side by side, not
+two versions of the same thing where the newer one wins.
+
+**Why the duplication had to be eliminated by extraction, not just by
+one caller wrapping the other:** having `api.py` call into `cli.py`'s
+functions (or vice versa) would couple a presentation module's
+interface — CLI argument parsing, `print()`, `sys.exit()` — to logic
+that has nothing to do with either presentation surface. `service.py`
+functions raise typed exceptions (`ApprovalNotFoundError`,
+`ApprovalAlreadyResolvedError`) and return plain result objects
+(`AuthorizationResult`, `ResolutionResult`) precisely so each
+presentation layer decides for itself how to represent them — an exit
+code and a printed message for the CLI, an HTTP status code and a JSON
+body for the API — without service.py knowing or caring which one is
+asking.
+
 ## Open items
 
 - **Multi-instance replay protection isn't solved** — this is

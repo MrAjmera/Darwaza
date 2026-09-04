@@ -5,39 +5,33 @@
   python -m darwaza.cli review
   python -m darwaza.cli approve <request_id>
   python -m darwaza.cli deny <request_id>
+
+Pure presentation: every actual decision, claim, log write, explanation,
+and enqueue happens in service.authorize() (see service.py and
+DECISIONS.md, Stage 4) — this module's job is loading input, printing
+output, and letting a human resolve pending approvals. The old
+_SEEN_NONCES module-level NonceStore, and the two near-identical copies
+of "evaluate -> log -> explain -> enqueue" that used to live in decide()
+and simulate(), are gone: both now just call service.authorize() and
+print whatever comes back.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import sys
-from pathlib import Path
 
-from darwaza import llm_explainer, razorpay_client
-from darwaza.approval_queue import ApprovalQueue
-from darwaza.audit_log import append_entry
-from darwaza.nonce_store import NonceStore
-from darwaza.policy_engine import evaluate
+from darwaza import service
 from darwaza.schema import Decision, NormalizedMandate, Outcome, ProposedTransaction
+from darwaza.service import AuthorizationResult
 from darwaza.simulate import SCENARIOS
 
-# State file locations. Default to the repo root (stable regardless of
-# the caller's cwd — this is a real gateway's persistent state, not
-# scratch output, so it shouldn't move around based on where you happen
-# to invoke the command from). Overridable via env vars so tests (and a
-# user who wants a clean, isolated demo run) can point them elsewhere
-# without touching the real repo-root files.
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_LOG_PATH = Path(os.environ.get("DARWAZA_AUDIT_LOG_PATH", str(REPO_ROOT / "audit_log.jsonl")))
-DEFAULT_NONCE_DB_PATH = Path(os.environ.get("DARWAZA_NONCE_DB_PATH", str(REPO_ROOT / "nonces.db")))
-DEFAULT_APPROVAL_DB_PATH = Path(
-    os.environ.get("DARWAZA_APPROVAL_DB_PATH", str(REPO_ROOT / "approvals.db"))
-)
-
-# Persistent across CLI invocations and process restarts — see
-# nonce_store.py and DECISIONS.md.
-_SEEN_NONCES = NonceStore(DEFAULT_NONCE_DB_PATH)
+# Re-exported for anyone importing these from cli.py's old location
+# (env-var-overridable state file paths; see service.py for where they
+# actually live now and DECISIONS.md for why they moved).
+DEFAULT_LOG_PATH = service.DEFAULT_LOG_PATH
+DEFAULT_NONCE_DB_PATH = service.DEFAULT_NONCE_DB_PATH
+DEFAULT_APPROVAL_DB_PATH = service.DEFAULT_APPROVAL_DB_PATH
 
 
 def _load(path: str):
@@ -52,41 +46,32 @@ def _print_decision(mandate_id: str, decision: Decision) -> None:
     print(f"Failed on: {decision.failed_check or '-'}")
 
 
-def _handle_result(
-    mandate: NormalizedMandate, proposed_tx: ProposedTransaction, decision: Decision
-) -> None:
-    """Common tail for both `decide` and `simulate`: print, log, and — if
-    the outcome is NEEDS_HUMAN — get an explanation and enqueue it for a
-    human to resolve via `review`/`approve`/`deny`."""
-    _print_decision(mandate.mandate_id, decision)
+def _print_authorization_result(result: AuthorizationResult) -> None:
+    """Shared print tail for both `decide` and `simulate` — the one place
+    this CLI turns an AuthorizationResult into terminal output. Whatever
+    service.authorize() actually did (claim the nonce, write the audit
+    entry, and — only for NEEDS_HUMAN — explain and enqueue) already
+    happened before this is called; this function does not decide
+    anything or touch any store."""
+    _print_decision(result.mandate_id, result.decision)
 
-    entry = append_entry(DEFAULT_LOG_PATH, mandate.mandate_id, decision)
     print(f"\nAudit log entry written to {DEFAULT_LOG_PATH}")
-    print(f"  chained to prior entry: {entry['prev_hash'][:12]}...")
+    print(f"  chained to prior entry: {result.audit_entry['prev_hash'][:12]}...")
 
-    if decision.outcome == Outcome.NEEDS_HUMAN:
-        explanation = llm_explainer.explain(mandate, proposed_tx, decision)
-        queue = ApprovalQueue(DEFAULT_APPROVAL_DB_PATH)
-        try:
-            request_id = queue.enqueue(mandate, proposed_tx, decision, explanation)
-        finally:
-            queue.close()
-        print(f"\nFlagged for human review — request id: {request_id}")
-        print(f"Explanation: {explanation}")
-        print(f"Resolve with: python -m darwaza.cli approve {request_id}")
-        print(f"          or: python -m darwaza.cli deny {request_id}")
+    if result.decision.outcome == Outcome.NEEDS_HUMAN:
+        print(f"\nFlagged for human review — request id: {result.request_id}")
+        print(f"Explanation: {result.explanation}")
+        print(f"Resolve with: python -m darwaza.cli approve {result.request_id}")
+        print(f"          or: python -m darwaza.cli deny {result.request_id}")
 
 
 def decide(mandate_path: str, tx_path: str) -> None:
     mandate = NormalizedMandate.model_validate(_load(mandate_path))
     proposed_tx = ProposedTransaction.model_validate(_load(tx_path))
 
-    # evaluate() claims the nonce itself now, atomically, as its last
-    # step, for both ALLOW and NEEDS_HUMAN (see DECISIONS.md, Stage 3 —
-    # the old check-then-add pattern here was D1's TOCTOU race).
-    decision = evaluate(mandate, proposed_tx, _SEEN_NONCES)
+    result = service.authorize(mandate, proposed_tx)
 
-    _handle_result(mandate, proposed_tx, decision)
+    _print_authorization_result(result)
 
 
 def simulate(scenario_name: str) -> None:
@@ -95,33 +80,18 @@ def simulate(scenario_name: str) -> None:
         sys.exit(1)
 
     scenario_fn = SCENARIOS[scenario_name]
-    result = scenario_fn(log_path=DEFAULT_LOG_PATH, nonce_db_path=DEFAULT_NONCE_DB_PATH)
+    result = scenario_fn(
+        log_path=DEFAULT_LOG_PATH,
+        nonce_db_path=DEFAULT_NONCE_DB_PATH,
+        approval_db_path=DEFAULT_APPROVAL_DB_PATH,
+    )
 
     print(f"Scenario:  {scenario_name}")
-    # scenario functions already print/log via _run(); _handle_result
-    # would double-log, so just handle the NEEDS_HUMAN enqueue step here.
-    _print_decision(result.mandate_id, result.decision)
-    print(f"\nAudit log entry written to {DEFAULT_LOG_PATH}")
-
-    if result.decision.outcome == Outcome.NEEDS_HUMAN:
-        explanation = llm_explainer.explain(result.mandate, result.proposed_tx, result.decision)
-        queue = ApprovalQueue(DEFAULT_APPROVAL_DB_PATH)
-        try:
-            request_id = queue.enqueue(result.mandate, result.proposed_tx, result.decision, explanation)
-        finally:
-            queue.close()
-        print(f"\nFlagged for human review — request id: {request_id}")
-        print(f"Explanation: {explanation}")
-        print(f"Resolve with: python -m darwaza.cli approve {request_id}")
-        print(f"          or: python -m darwaza.cli deny {request_id}")
+    _print_authorization_result(result)
 
 
 def review() -> None:
-    queue = ApprovalQueue(DEFAULT_APPROVAL_DB_PATH)
-    try:
-        pending = queue.list_pending()
-    finally:
-        queue.close()
+    pending = service.list_pending_approvals()
 
     if not pending:
         print("No pending approvals.")
@@ -135,53 +105,28 @@ def review() -> None:
 
 
 def _resolve(request_id: str, *, approved: bool) -> None:
-    queue = ApprovalQueue(DEFAULT_APPROVAL_DB_PATH)
     try:
-        row = queue.get(request_id)
-        if row is None:
-            print(f"No approval request with id '{request_id}'.")
-            sys.exit(1)
-        if row["status"] != "pending":
-            print(f"Request '{request_id}' is already {row['status']}.")
-            sys.exit(1)
+        result = service.resolve_approval(request_id, approved=approved)
+    except service.ApprovalNotFoundError as exc:
+        print(str(exc))
+        sys.exit(1)
+    except service.ApprovalAlreadyResolvedError as exc:
+        print(str(exc))
+        sys.exit(1)
 
-        queue.resolve(request_id, approved=approved)
-    finally:
-        queue.close()
-
-    mandate = NormalizedMandate.model_validate_json(row["mandate_json"])
-    proposed_tx = ProposedTransaction.model_validate_json(row["proposed_tx_json"])
-
-    # The human's decision is itself recorded as a new audit log entry —
-    # the audit trail for a NEEDS_HUMAN mandate is now two lines: the
-    # deterministic flag, then the human resolution. This is the human
-    # action DECISIONS.md's thesis is about: it's what re-anchors
-    # liability for this one transaction.
-    outcome = Outcome.ALLOW if approved else Outcome.DENY
-    verb = "Approved" if approved else "Denied"
-    human_decision = Decision(
-        outcome=outcome,
-        reason=f"{verb} by human review (request {request_id}). Original flag: {row['reason']}",
-        failed_check=None if approved else "human_review_denied",
+    verb = "APPROVED" if result.approved else "DENIED"
+    print(f"Request {request_id}: {verb}")
+    print(
+        f"Audit log entry written to {DEFAULT_LOG_PATH} "
+        f"(chained to {result.audit_entry['prev_hash'][:12]}...)"
     )
-    entry = append_entry(DEFAULT_LOG_PATH, mandate.mandate_id, human_decision)
-    print(f"Request {request_id}: {verb.upper()}")
-    print(f"Audit log entry written to {DEFAULT_LOG_PATH} (chained to {entry['prev_hash'][:12]}...)")
 
-    if approved:
-        # No _SEEN_NONCES.add() here: this mandate was already claimed
-        # when evaluate() first produced NEEDS_HUMAN for it (see
-        # decide()/simulate.py and DECISIONS.md, D4 and Stage 3) — a
-        # pending request in this queue is, by construction, already
-        # reserved. Re-adding here would just be re-confirming state
-        # that's already true.
-        try:
-            order = razorpay_client.create_order(
-                proposed_tx.amount, receipt=f"darwaza-{mandate.mandate_id}"
-            )
-            print(f"Razorpay test-mode order created: {order.get('id', order)}")
-        except RuntimeError as exc:
-            print(f"(Razorpay order not created: {exc})")
+    if result.approved:
+        if result.razorpay_order is not None:
+            order_id = result.razorpay_order.get("id", result.razorpay_order)
+            print(f"Razorpay test-mode order created: {order_id}")
+        else:
+            print(f"(Razorpay order not created: {result.razorpay_error})")
 
 
 def approve(request_id: str) -> None:

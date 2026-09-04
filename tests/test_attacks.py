@@ -153,7 +153,9 @@ def test_attack_poisoned_catalog_is_denied(tmp_path):
     from darwaza.simulate import scenario_poisoned_catalog
 
     result = scenario_poisoned_catalog(
-        log_path=tmp_path / "audit_log.jsonl", nonce_db_path=tmp_path / "nonces.db"
+        log_path=tmp_path / "audit_log.jsonl",
+        nonce_db_path=tmp_path / "nonces.db",
+        approval_db_path=tmp_path / "approvals.db",
     )
     assert result.decision.outcome == "DENY"
     assert result.decision.failed_check == "amount_cap"

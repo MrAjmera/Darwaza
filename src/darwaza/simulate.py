@@ -1,4 +1,5 @@
-"""Live end-to-end scenarios: buyer agent -> gate -> audit log.
+"""Live end-to-end scenarios: buyer agent -> gate -> audit log ->
+(NEEDS_HUMAN only) explain + enqueue.
 
 tests/test_attacks.py constructs mandates and transactions directly and
 asserts on evaluate()'s return value — good for unit-level proof, but it
@@ -8,9 +9,13 @@ runs that full path, which is what the pitch video demo and the
 "attempt -> block -> audit log line" framing actually need.
 
 Each scenario function: builds a signed mandate, asks buyer_agent for a
-proposed transaction, runs it through policy_engine.evaluate(), records
-the result to the audit log, and returns the Decision so a caller (the
-CLI, or a test) can assert on it.
+proposed transaction, and hands both to service.authorize() — the same
+function cli.py and api.py call, so a scenario run through here goes
+through the identical enforcement path a real request would. This used
+to duplicate part of that path itself (evaluate + claim + log, but not
+explain/enqueue, which cli.py's simulate() bolted on afterward,
+separately, with its own copy of that logic); as of Stage 4 that
+duplication is gone.
 """
 
 from __future__ import annotations
@@ -18,11 +23,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from darwaza import buyer_agent, keys
-from darwaza.audit_log import append_entry
-from darwaza.nonce_store import NonceStore
-from darwaza.policy_engine import evaluate
-from darwaza.schema import Decision, NormalizedMandate, ProposedTransaction
+from darwaza import buyer_agent, keys, service
+from darwaza.schema import NormalizedMandate, ProposedTransaction
+from darwaza.service import AuthorizationResult
 
 PRINCIPAL_ID = "user-krishna"
 
@@ -42,48 +45,38 @@ def _signed_mandate(mandate_id: str, **overrides) -> NormalizedMandate:
     return mandate.model_copy(update={"signature": keys.sign(mandate.signing_payload())})
 
 
-class ScenarioResult:
-    """What a scenario produced: the mandate and proposed transaction
-    involved (so a caller can enqueue a NEEDS_HUMAN result for human
-    review, or just print/log them) and the Decision evaluate() returned."""
-
-    def __init__(self, mandate: NormalizedMandate, proposed_tx, decision: Decision) -> None:
-        self.mandate = mandate
-        self.mandate_id = mandate.mandate_id
-        self.proposed_tx = proposed_tx
-        self.decision = decision
-
-
 def _run(
     mandate: NormalizedMandate,
-    proposed_tx,
+    proposed_tx: ProposedTransaction,
     *,
     log_path: Path,
     nonce_db_path: Path,
-) -> ScenarioResult:
-    store = NonceStore(nonce_db_path)
-    try:
-        # evaluate() claims the nonce itself now, atomically, as its
-        # last check, for both ALLOW and NEEDS_HUMAN. See cli.py's
-        # decide() and DECISIONS.md (D4, and Stage 3's atomic-claim fix
-        # for D1 — the old check-then-add pattern here was the race).
-        decision = evaluate(mandate, proposed_tx, store)
-    finally:
-        store.close()
-
-    append_entry(log_path, mandate.mandate_id, decision)
-    return ScenarioResult(mandate, proposed_tx, decision)
+    approval_db_path: Path,
+) -> AuthorizationResult:
+    return service.authorize(
+        mandate,
+        proposed_tx,
+        log_path=log_path,
+        nonce_db_path=nonce_db_path,
+        approval_db_path=approval_db_path,
+    )
 
 
-def scenario_happy_path(*, log_path: Path, nonce_db_path: Path) -> ScenarioResult:
+def scenario_happy_path(
+    *, log_path: Path, nonce_db_path: Path, approval_db_path: Path
+) -> AuthorizationResult:
     """A legitimate buyer agent, buying something ordinary and in-budget.
     Expected: ALLOW."""
     mandate = _signed_mandate("sim-happy-1")
     proposed_tx = buyer_agent.decide_deterministic("books")
-    return _run(mandate, proposed_tx, log_path=log_path, nonce_db_path=nonce_db_path)
+    return _run(
+        mandate, proposed_tx, log_path=log_path, nonce_db_path=nonce_db_path, approval_db_path=approval_db_path
+    )
 
 
-def scenario_poisoned_catalog(*, log_path: Path, nonce_db_path: Path) -> ScenarioResult:
+def scenario_poisoned_catalog(
+    *, log_path: Path, nonce_db_path: Path, approval_db_path: Path
+) -> AuthorizationResult:
     """A buyer agent that (as an unguarded LLM-based agent would) obeys
     an instruction embedded in a product description, inflating the
     transaction to 999,999. Expected: DENY on amount_cap — the mandate's
@@ -93,10 +86,14 @@ def scenario_poisoned_catalog(*, log_path: Path, nonce_db_path: Path) -> Scenari
     proposed_tx = buyer_agent.decide_deterministic(
         "electronics", obey_injected_instructions=True
     )
-    return _run(mandate, proposed_tx, log_path=log_path, nonce_db_path=nonce_db_path)
+    return _run(
+        mandate, proposed_tx, log_path=log_path, nonce_db_path=nonce_db_path, approval_db_path=approval_db_path
+    )
 
 
-def scenario_large_purchase_needs_human(*, log_path: Path, nonce_db_path: Path) -> ScenarioResult:
+def scenario_large_purchase_needs_human(
+    *, log_path: Path, nonce_db_path: Path, approval_db_path: Path
+) -> AuthorizationResult:
     """A legitimate (non-attack) purchase that happens to consume most of
     the mandate's cap in one request — the NEEDS_HUMAN path, not an
     attack. Amount is picked directly (not via buyer_agent) because this
@@ -107,7 +104,9 @@ def scenario_large_purchase_needs_human(*, log_path: Path, nonce_db_path: Path) 
     proposed_tx = ProposedTransaction(
         merchant_id="merchant-bestbuy", amount=650.0, category="electronics"
     )
-    return _run(mandate, proposed_tx, log_path=log_path, nonce_db_path=nonce_db_path)
+    return _run(
+        mandate, proposed_tx, log_path=log_path, nonce_db_path=nonce_db_path, approval_db_path=approval_db_path
+    )
 
 
 SCENARIOS = {
