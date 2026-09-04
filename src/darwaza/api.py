@@ -21,6 +21,9 @@ temp directory via `app.dependency_overrides`, without depending on
 which test module happens to import darwaza.service first (module-level
 constants computed once at import time, like these, are exactly the
 kind of thing import order can make fragile to override any other way).
+The rate limiter (`_rate_limiter`, see rate_limit.py) is injected the
+same way and for the same reason — tests override it with a
+tiny-capacity instance to exercise 429 without waiting on real time.
 
 Run it with:
     uvicorn darwaza.api:app --reload
@@ -28,7 +31,6 @@ Run it with:
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,7 +39,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from darwaza import service
+from darwaza import observability, rate_limit, service
 from darwaza.audit_log import verify_chain
 from darwaza.schema import NormalizedMandate, Outcome, ProposedTransaction
 
@@ -67,6 +69,21 @@ def _nonce_db_path() -> Path:
 
 def _approval_db_path() -> Path:
     return service.DEFAULT_APPROVAL_DB_PATH
+
+
+# Default: 10-request burst, refilling at 10/hour thereafter. Generous
+# for a human-paced flow (DECISIONS.md's "three purchases an hour")
+# while a tight loop exhausts its burst in well under a second and is
+# then throttled to roughly one request every six minutes. One shared,
+# process-wide instance — same lifetime as observability.COUNTERS, and
+# for the same reason: this is per-process rate limiting, not
+# coordinated across instances (see DECISIONS.md's multi-instance open
+# item, which applies here too).
+_AUTHORIZE_RATE_LIMITER = rate_limit.RateLimiter(capacity=10, refill_rate_per_second=10 / 3600)
+
+
+def _rate_limiter() -> rate_limit.RateLimiter:
+    return _AUTHORIZE_RATE_LIMITER
 
 
 # ---------------------------------------------------------------------------
@@ -110,12 +127,10 @@ def _decision_body(result: service.AuthorizationResult) -> dict:
 #   malformed body -> 400 (see the RequestValidationError handler below —
 #                     FastAPI's default is 422; this project's spec calls
 #                     for 400, so that default is overridden)
-#   rate limited   -> 429 with Retry-After — NOT implemented yet. This
-#                     endpoint has no rate limiter in front of it as of
-#                     Stage 4; rate_limit.py (Stage 5) adds one, keyed
-#                     per-agent/per-mandate rather than per-IP. Named
-#                     here, not faked with a hardcoded 429 that never
-#                     fires under real load.
+#   rate limited   -> 429 with Retry-After, from rate_limit.py (Stage 5),
+#                     keyed per-agent/per-mandate rather than per-IP —
+#                     see rate_limit.py's module docstring and
+#                     DECISIONS.md for why.
 #
 # 202 is used on purpose for NEEDS_HUMAN: "accepted for processing, not
 # complete" is exactly what NEEDS_HUMAN means — the request was
@@ -129,7 +144,25 @@ def authorize(
     log_path: Path = Depends(_log_path),
     nonce_db_path: Path = Depends(_nonce_db_path),
     approval_db_path: Path = Depends(_approval_db_path),
+    limiter: rate_limit.RateLimiter = Depends(_rate_limiter),
 ) -> JSONResponse:
+    # Rate limiting runs before evaluate() and is NOT a policy DENY —
+    # "we didn't evaluate this one, try again shortly" is a different
+    # claim than "we evaluated this and rejected it," which is exactly
+    # why it's a distinct status code (429, not 403) and doesn't touch
+    # the nonce store, audit log, or counters at all.
+    agent_key = payload.mandate.agent_id or payload.mandate.principal_id
+    allowed, retry_after = limiter.allow(agent_key, payload.mandate.mandate_id)
+    if not allowed:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "rate_limited",
+                "detail": "Too many authorize requests for this agent/mandate.",
+            },
+            headers={"Retry-After": str(max(1, round(retry_after)))},
+        )
+
     result = service.authorize(
         payload.mandate,
         payload.proposed_tx,
@@ -241,48 +274,42 @@ def healthz() -> dict:
 
 @app.get("/metrics")
 def metrics(log_path: Path = Depends(_log_path)) -> dict:
-    """Counters derived directly from the audit log — every decision
-    this process has ever made is already durably recorded there, so
-    this is real data, not a placeholder, even though it's not what
-    Stage 5's observability.py will eventually provide.
+    """Two different kinds of number, clearly labeled as such rather
+    than merged into one undifferentiated blob:
 
-    What this deliberately is NOT: per-request timing, a decision_id
-    breakdown, or anything resembling Prometheus's text exposition
-    format. Stage 5 adds structured, per-check-timed observability with
-    counters broken down by failed_check, threaded through a minted
-    decision_id — a genuinely different, richer thing than "read the
-    audit log and count outcomes." This endpoint exists now so
-    `GET /metrics` is a real, working URL from Stage 4 on; what it
-    returns gets more detailed later, not what it means.
+    - `counters`: ALLOW/DENY/NEEDS_HUMAN broken down by failed_check,
+      from observability.COUNTERS — in-process, thread-safe, and reset
+      to zero every time this process restarts. This is what a real
+      metrics/dashboard consumer wants: current, per-instance activity.
+    - `audit_log`: entry count and hash-chain integrity, read directly
+      from the durable audit log — survives restarts, reflects this
+      process's *entire* history including before it last restarted,
+      and is intentionally NOT what `counters` reports (see
+      observability.py's module docstring for why the audit log and
+      observability counters are kept as two separate concerns with two
+      separate storage strategies, not one).
+
+    Because of that difference, `counters` and `audit_log` can
+    legitimately disagree — e.g. right after a restart, `counters` reads
+    all zero while `audit_log` still shows every decision this instance
+    has ever recorded. That's not a bug in either number.
     """
-    counts = {"ALLOW": 0, "DENY": 0, "NEEDS_HUMAN": 0}
-    failed_checks: dict[str, int] = {}
-    total_entries = 0
+    counters = observability.COUNTERS.snapshot()
 
+    total_entries = 0
     if log_path.exists():
         with log_path.open("r", encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                total_entries += 1
-                outcome = entry.get("outcome")
-                if outcome in counts:
-                    counts[outcome] += 1
-                failed_check = entry.get("failed_check")
-                if failed_check:
-                    failed_checks[failed_check] = failed_checks.get(failed_check, 0) + 1
+                if line.strip():
+                    total_entries += 1
 
     chain_ok, chain_break_reason = verify_chain(log_path)
 
     return {
-        "audit_log_entries": total_entries,
-        "outcomes": counts,
-        "failed_checks": failed_checks,
-        "audit_chain_intact": chain_ok,
-        "audit_chain_break_reason": chain_break_reason,
+        "counters": counters,
+        "audit_log": {
+            "entries": total_entries,
+            "chain_intact": chain_ok,
+            "chain_break_reason": chain_break_reason,
+        },
     }

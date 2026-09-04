@@ -19,11 +19,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from darwaza import config, llm_explainer, razorpay_client
+from darwaza import config, llm_explainer, observability, razorpay_client
 from darwaza.approval_queue import ApprovalQueue
 from darwaza.audit_log import append_entry
 from darwaza.nonce_store import NonceStore
-from darwaza.policy_engine import evaluate
+from darwaza.policy_engine import evaluate, verify_signature
 from darwaza.schema import Decision, NormalizedMandate, Outcome, ProposedTransaction
 
 # State file paths now live in config.py (Stage 5) — every module reads
@@ -50,6 +50,7 @@ class AuthorizationResult:
         decision: Decision,
         audit_entry: dict,
         *,
+        decision_id: str,
         request_id: str | None = None,
         explanation: str | None = None,
     ) -> None:
@@ -58,6 +59,7 @@ class AuthorizationResult:
         self.proposed_tx = proposed_tx
         self.decision = decision
         self.audit_entry = audit_entry
+        self.decision_id = decision_id
         # Only set when decision.outcome is NEEDS_HUMAN — see authorize().
         self.request_id = request_id
         self.explanation = explanation
@@ -84,14 +86,30 @@ def authorize(
     should construct a NonceStore, ApprovalQueue, or call evaluate()/
     append_entry()/llm_explainer.explain() directly; if a caller finds
     itself doing that, the logic belongs here instead.
+
+    A `decision_id` is minted here — "at the door" — and threaded
+    through the audit entry, the approval queue row (for NEEDS_HUMAN),
+    and the structured log line this call emits (see observability.py).
     """
+    decision_id = observability.new_decision_id()
+
+    # Timed separately from the evaluate() call below (a second,
+    # harmless call — verify_signature() is pure/side-effect-free)
+    # because it's the one check in evaluate() with real computational
+    # cost (Ed25519 crypto) worth measuring on its own; see
+    # observability.py's module docstring for why the other ~7 checks
+    # aren't individually instrumented.
+    with observability.time_decision() as sig_timer:
+        verify_signature(mandate)
+
     store = NonceStore(nonce_db_path)
     try:
-        decision = evaluate(mandate, proposed_tx, store)
+        with observability.time_decision() as eval_timer:
+            decision = evaluate(mandate, proposed_tx, store)
     finally:
         store.close()
 
-    audit_entry = append_entry(log_path, mandate.mandate_id, decision)
+    audit_entry = append_entry(log_path, mandate.mandate_id, decision, decision_id=decision_id)
 
     request_id = None
     explanation = None
@@ -99,15 +117,28 @@ def authorize(
         explanation = llm_explainer.explain(mandate, proposed_tx, decision)
         queue = ApprovalQueue(approval_db_path)
         try:
-            request_id = queue.enqueue(mandate, proposed_tx, decision, explanation)
+            request_id = queue.enqueue(
+                mandate, proposed_tx, decision, explanation, decision_id=decision_id
+            )
         finally:
             queue.close()
+
+    observability.log_decision(
+        decision_id=decision_id,
+        mandate_id=mandate.mandate_id,
+        outcome=decision.outcome.value,
+        failed_check=decision.failed_check,
+        evaluate_duration_ms=eval_timer["duration_ms"],
+        signature_verify_duration_ms=sig_timer["duration_ms"],
+        request_id=request_id,
+    )
 
     return AuthorizationResult(
         mandate,
         proposed_tx,
         decision,
         audit_entry,
+        decision_id=decision_id,
         request_id=request_id,
         explanation=explanation,
     )
@@ -162,6 +193,7 @@ class ResolutionResult:
         decision: Decision,
         audit_entry: dict,
         *,
+        decision_id: str,
         approved: bool,
         razorpay_order: dict | None = None,
         razorpay_error: str | None = None,
@@ -171,6 +203,7 @@ class ResolutionResult:
         self.proposed_tx = proposed_tx
         self.decision = decision
         self.audit_entry = audit_entry
+        self.decision_id = decision_id
         self.approved = approved
         self.razorpay_order = razorpay_order
         self.razorpay_error = razorpay_error
@@ -196,7 +229,16 @@ def resolve_approval(
     turns those into a printed message and exit code) and api.py (which
     turns them into 404/409 responses); which presentation happens is
     not this function's decision to make.
+
+    A fresh `decision_id` is minted for this call — a human's
+    approve/deny is its own decision event, not a continuation of the
+    original NEEDS_HUMAN one (see DECISIONS.md #7: the audit trail is
+    two independently-chained entries, not one edited in place). The
+    two decision_ids are correlated via `request_id`/`mandate_id` in
+    the structured logs and the approval queue row, not merged into one.
     """
+    decision_id = observability.new_decision_id()
+
     queue = ApprovalQueue(approval_db_path)
     try:
         row = queue.get(request_id)
@@ -223,7 +265,7 @@ def resolve_approval(
         reason=f"{verb} by human review (request {request_id}). Original flag: {row['reason']}",
         failed_check=None if approved else "human_review_denied",
     )
-    audit_entry = append_entry(log_path, mandate.mandate_id, human_decision)
+    audit_entry = append_entry(log_path, mandate.mandate_id, human_decision, decision_id=decision_id)
 
     razorpay_order = None
     razorpay_error = None
@@ -239,12 +281,23 @@ def resolve_approval(
         except RuntimeError as exc:
             razorpay_error = str(exc)
 
+    observability.log_resolution(
+        decision_id=decision_id,
+        request_id=request_id,
+        mandate_id=mandate.mandate_id,
+        outcome=human_decision.outcome.value,
+        approved=approved,
+        razorpay_order_id=razorpay_order.get("id") if razorpay_order else None,
+        razorpay_error=razorpay_error,
+    )
+
     return ResolutionResult(
         request_id,
         mandate,
         proposed_tx,
         human_decision,
         audit_entry,
+        decision_id=decision_id,
         approved=approved,
         razorpay_order=razorpay_order,
         razorpay_error=razorpay_error,

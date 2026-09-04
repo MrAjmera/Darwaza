@@ -75,7 +75,9 @@ class ApprovalQueue:
             "  status TEXT NOT NULL DEFAULT 'pending',"  # pending|approved|denied
             "  created_at TEXT NOT NULL,"
             "  resolved_at TEXT,"
-            "  resolved_by TEXT"
+            "  resolved_by TEXT,"
+            "  decision_id TEXT"  # Stage 5, see observability.py -- nullable,
+                                   # same reasoning as audit_log.py's decision_id.
             ")"
         )
         conn.commit()
@@ -96,13 +98,15 @@ class ApprovalQueue:
         proposed_tx: ProposedTransaction,
         decision: Decision,
         explanation: str,
+        *,
+        decision_id: str | None = None,
     ) -> str:
         request_id = str(uuid.uuid4())
         conn = self._connection()
         conn.execute(
             "INSERT INTO pending_approvals "
-            "(id, mandate_id, mandate_json, proposed_tx_json, reason, explanation, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+            "(id, mandate_id, mandate_json, proposed_tx_json, reason, explanation, status, created_at, decision_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
             (
                 request_id,
                 mandate.mandate_id,
@@ -111,6 +115,7 @@ class ApprovalQueue:
                 decision.reason,
                 explanation,
                 datetime.now(timezone.utc).isoformat(),
+                decision_id,
             ),
         )
         conn.commit()
@@ -118,17 +123,24 @@ class ApprovalQueue:
 
     def list_pending(self) -> list[dict]:
         rows = self._connection().execute(
-            "SELECT id, mandate_id, reason, explanation, created_at "
+            "SELECT id, mandate_id, reason, explanation, created_at, decision_id "
             "FROM pending_approvals WHERE status = 'pending' ORDER BY created_at"
         ).fetchall()
         return [
-            {"id": r[0], "mandate_id": r[1], "reason": r[2], "explanation": r[3], "created_at": r[4]}
+            {
+                "id": r[0],
+                "mandate_id": r[1],
+                "reason": r[2],
+                "explanation": r[3],
+                "created_at": r[4],
+                "decision_id": r[5],
+            }
             for r in rows
         ]
 
     def get(self, request_id: str) -> dict | None:
         row = self._connection().execute(
-            "SELECT id, mandate_id, mandate_json, proposed_tx_json, reason, explanation, status "
+            "SELECT id, mandate_id, mandate_json, proposed_tx_json, reason, explanation, status, decision_id "
             "FROM pending_approvals WHERE id = ?",
             (request_id,),
         ).fetchone()
@@ -142,6 +154,7 @@ class ApprovalQueue:
             "reason": row[4],
             "explanation": row[5],
             "status": row[6],
+            "decision_id": row[7],
         }
 
     def resolve(self, request_id: str, *, approved: bool, resolved_by: str = "human") -> None:

@@ -6,27 +6,35 @@ _nonce_db_path, _approval_db_path — see api.py's module docstring for
 why they're dependencies rather than module constants read directly)
 to point at an isolated tmp_path, so tests never touch the real repo's
 audit_log.jsonl/nonces.db/approvals.db regardless of which test module
-darwaza.service happened to be imported by first.
+darwaza.service happened to be imported by first. The rate limiter
+(_rate_limiter) is overridden too, with a generous instance by default
+so ordinary multi-call tests never get throttled by accident — the
+dedicated rate-limiting tests below override it again, per-test, with a
+tiny-capacity instance instead.
 """
 
 from __future__ import annotations
 
 import os
+
+# Popped before any darwaza import, not after -- config.py resolves
+# credentials once at first import, so this only works if it runs
+# first. See config.py's module docstring.
+os.environ.pop("ANTHROPIC_API_KEY", None)
+os.environ.pop("RAZORPAY_KEY_ID", None)
+os.environ.pop("RAZORPAY_KEY_SECRET", None)
+
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
 from darwaza import keys
-from darwaza.api import _approval_db_path, _log_path, _nonce_db_path, app
+from darwaza.api import _approval_db_path, _log_path, _nonce_db_path, _rate_limiter, app
+from darwaza.rate_limit import RateLimiter
 from darwaza.schema import NormalizedMandate
 
 FUTURE = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
-
-# Force the fallback explainer / no real Razorpay calls in tests.
-os.environ.pop("ANTHROPIC_API_KEY", None)
-os.environ.pop("RAZORPAY_KEY_ID", None)
-os.environ.pop("RAZORPAY_KEY_SECRET", None)
 
 
 def _signed_mandate_dict(mandate_id: str, **overrides) -> dict:
@@ -50,10 +58,14 @@ def client(tmp_path):
     log_path = tmp_path / "audit_log.jsonl"
     nonce_db_path = tmp_path / "nonces.db"
     approval_db_path = tmp_path / "approvals.db"
+    # Generous on purpose -- high enough that no test below that isn't
+    # specifically testing rate limiting could plausibly hit it.
+    generous_limiter = RateLimiter(capacity=1000, refill_rate_per_second=1000)
 
     app.dependency_overrides[_log_path] = lambda: log_path
     app.dependency_overrides[_nonce_db_path] = lambda: nonce_db_path
     app.dependency_overrides[_approval_db_path] = lambda: approval_db_path
+    app.dependency_overrides[_rate_limiter] = lambda: generous_limiter
 
     with TestClient(app) as test_client:
         yield test_client
@@ -245,7 +257,55 @@ def test_metrics_reflects_recorded_outcomes(client):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["outcomes"]["ALLOW"] >= 1
-    assert body["outcomes"]["DENY"] >= 1
-    assert body["failed_checks"].get("amount_cap", 0) >= 1
-    assert body["audit_chain_intact"] is True
+    # counters: in-process, from observability.COUNTERS (shared across
+    # this whole test module's client fixture instances, hence >= not
+    # ==, since other tests' decisions accumulate in the same process).
+    assert body["counters"]["by_outcome"]["ALLOW"] >= 1
+    assert body["counters"]["by_outcome"]["DENY"] >= 1
+    assert body["counters"]["by_failed_check"].get("amount_cap", 0) >= 1
+    # audit_log: durable, derived from this test's own isolated log file.
+    assert body["audit_log"]["entries"] >= 2
+    assert body["audit_log"]["chain_intact"] is True
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting (429)
+# ---------------------------------------------------------------------------
+
+
+def test_authorize_rate_limited_returns_429_with_retry_after(client):
+    # A capacity-1 limiter for this test only -- the client fixture's
+    # default is deliberately generous so it never interferes here.
+    tiny_limiter = RateLimiter(capacity=1, refill_rate_per_second=0.0001)
+    app.dependency_overrides[_rate_limiter] = lambda: tiny_limiter
+
+    mandate = _signed_mandate_dict("api-rate-limit-1")
+    tx = {"merchant_id": "merchant-a", "amount": 500.0, "category": "electronics"}
+
+    first = client.post("/v1/authorize", json={"mandate": mandate, "proposed_tx": tx})
+    assert first.status_code == 200
+
+    second = client.post("/v1/authorize", json={"mandate": mandate, "proposed_tx": tx})
+    assert second.status_code == 429
+    assert second.json()["error"] == "rate_limited"
+    assert int(second.headers["retry-after"]) >= 1
+
+
+def test_rate_limit_is_keyed_per_agent_and_mandate_not_globally(client):
+    """Two different (agent, mandate) pairs must not share one budget --
+    exhausting one must not throttle the other."""
+    tiny_limiter = RateLimiter(capacity=1, refill_rate_per_second=0.0001)
+    app.dependency_overrides[_rate_limiter] = lambda: tiny_limiter
+
+    mandate_a = _signed_mandate_dict("api-rate-limit-a", agent_id="agent-a")
+    mandate_b = _signed_mandate_dict("api-rate-limit-b", agent_id="agent-b")
+    tx = {"merchant_id": "merchant-a", "amount": 500.0, "category": "electronics"}
+
+    exhaust = client.post("/v1/authorize", json={"mandate": mandate_a, "proposed_tx": tx})
+    assert exhaust.status_code == 200
+
+    throttled = client.post("/v1/authorize", json={"mandate": mandate_a, "proposed_tx": tx})
+    assert throttled.status_code == 429
+
+    other_pair = client.post("/v1/authorize", json={"mandate": mandate_b, "proposed_tx": tx})
+    assert other_pair.status_code == 200  # different agent+mandate -- untouched budget

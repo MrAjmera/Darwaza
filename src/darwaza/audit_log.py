@@ -120,8 +120,19 @@ def _lock_path(log_path: Path) -> Path:
     return log_path.parent / (log_path.name + ".lock")
 
 
-def append_entry(log_path: Path, mandate_id: str, decision: Decision) -> dict:
-    """Append one decision to the log and return the entry that was written."""
+def append_entry(
+    log_path: Path, mandate_id: str, decision: Decision, *, decision_id: str | None = None
+) -> dict:
+    """Append one decision to the log and return the entry that was
+    written. `decision_id` (Stage 5, see observability.py) is the same
+    id minted "at the door" by service.authorize()/resolve_approval()
+    and threaded through that request's structured log lines and — for
+    NEEDS_HUMAN — its approval queue row, so all three can be found by
+    one id. It's optional here (None for any caller that doesn't have
+    one, e.g. a script inspecting/repairing the log directly) — this is
+    an audit-log field, not a foreign key some other table depends on
+    existing.
+    """
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     key = str(log_path.resolve())
@@ -134,6 +145,7 @@ def append_entry(log_path: Path, mandate_id: str, decision: Decision) -> dict:
             "seq": seq,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "mandate_id": mandate_id,
+            "decision_id": decision_id,
             "outcome": decision.outcome.value,
             "reason": decision.reason,
             "failed_check": decision.failed_check,

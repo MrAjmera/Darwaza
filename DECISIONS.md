@@ -572,6 +572,141 @@ key, so there's nothing safe to assert about their shape beyond
 "configured or not." Both remain genuinely optional, exactly as before
 this stage — this project runs end-to-end with neither set.
 
+## 15. Observability is a separate module from the audit log, with a
+    separate storage strategy — not a second reader of the same file
+
+**Chosen:** `observability.py` mints a `decision_id` at the door
+(inside `service.authorize()`/`resolve_approval()`) and threads it
+through that call's structured JSON log line, its `audit_log.py` entry,
+and — for NEEDS_HUMAN — its `approval_queue.py` row. Structured logs go
+through the standard `logging` module as one JSON line per decision.
+Counters (`observability.COUNTERS`, ALLOW/DENY/NEEDS_HUMAN by
+`failed_check`) are in-process and thread-safe, reset on restart.
+`api.py`'s `/metrics` reports these counters *and*, separately and
+clearly labeled, durable numbers read from the audit log (entry count,
+chain integrity) — never merged into one undifferentiated response.
+
+**Rejected:** Deriving `/metrics` entirely by re-scanning the audit log
+(what Stage 4's placeholder did), or writing observability data into
+the audit log itself as additional fields/entries.
+
+**Why these have to stay two different things, not one log serving two
+purposes:** the audit log's whole design — append-only, hash-chained,
+`seq`-ordered, OS-locked writes — exists to answer "can this be trusted
+to reconstruct a dispute," which is a durability and integrity
+question with a compliance/legal retention story behind it. Operational
+observability answers a completely different question — "what is this
+process doing right now" — for a completely different consumer (a
+dashboard, an on-call engineer), on a timescale where losing data on
+restart is fine and expected. Giving both concerns the SAME storage
+mechanism would force one of two bad outcomes: either the audit log
+grows retention/volume it doesn't actually need to keep forever (every
+timing sample, forever, hash-chained), or observability inherits
+durability machinery (file locks, atomic appends, tamper-evidence) it
+doesn't need to pay the cost of. Two modules, two storage strategies,
+correlated only by `decision_id` where useful, is what keeps each one
+honest about what it actually is.
+
+**Why "per-check timing" ended up meaning "signature verification,
+timed on its own, plus total decision time" and not eight individually
+instrumented checks:** `policy_engine.evaluate()` returns at the first
+failing check, by design, and every check except signature verification
+is a plain comparison against already-loaded fields — each fast enough
+that instrumenting it individually would produce timing noise, not
+signal. Splitting `evaluate()` into eight separately-callable functions
+purely to make each one independently timable would mean restructuring
+the one function this project has been most deliberate about keeping
+linear, simple, and auditable (DECISIONS.md #2), for a measurement
+that wouldn't be meaningful anyway. Signature verification is the one
+check with real cost (Ed25519 crypto) and is measured on its own, via a
+second, harmless call to the already-public `verify_signature()` —
+named directly as a simplification, not hidden as if every check were
+equally instrumented.
+
+**decision_id vs. request_id:** a `decision_id` is minted fresh for
+*every* call to `authorize()` or `resolve_approval()` — an ALLOW, a
+DENY, the original NEEDS_HUMAN flag, and the human's later approve/deny
+are four different decision events with four different ids, even
+though the last two concern the same mandate. `request_id` (the
+approval queue's primary key) is what correlates them across that
+gap — see DECISIONS.md #7's reasoning for why the human's resolution is
+a new, independently-chained audit entry rather than an edit to the
+first, which is the same reasoning applied one layer up to
+observability.
+
+## 16. Rate limiting is a token bucket keyed per-agent-and-mandate, not
+    per-IP, and sits in front of `authorize()`, not inside it
+
+**Chosen:** `rate_limit.RateLimiter` holds one `TokenBucket` per
+`(agent_key, mandate_id)` pair, created lazily. `agent_key` is
+`mandate.agent_id or mandate.principal_id` — an AP2 mandate's named
+acting agent if there is one, falling back to the principal who
+authorized it otherwise (an ACP token, or an AP2 mandate with no
+distinct agent, has no separate "agent" to speak of). Wired only into
+`api.py`'s `POST /v1/authorize`, as a check that runs *before*
+`service.authorize()` — a 429 never touches the nonce store, the audit
+log, or the observability counters, because it isn't a claim about the
+mandate being evaluated and rejected; it's a claim that this request
+wasn't evaluated at all yet.
+
+**Rejected:** Per-IP rate limiting (the default for most HTTP rate
+limiters), and folding the check into `policy_engine.evaluate()` as an
+eighth check.
+
+**Why per-agent-and-mandate instead of per-IP:** the attack class this
+exists for is a runaway or compromised buying agent spending a *valid*
+mandate correctly, just far too fast — a human makes a handful of
+purchases an hour; a looping agent can make thousands in the same
+window, and every one of those requests can carry a perfectly valid
+signature and pass every other check, because nothing about the
+request is malformed or unauthorized on its own. Per-IP limiting is
+both the wrong tool and an easy bypass here: a legitimate agent
+platform can run many distinct agents behind one IP (that IP would get
+throttled for behavior that isn't actually a problem), while an
+attacker distributing requests across many IPs defeats a per-IP limit
+trivially. What actually identifies "is this the same caller doing the
+same thing over and over" is the agent's own claimed identity plus
+which mandate it's spending — exactly what AP2's `agent_id`/ACP's
+implicit principal-as-agent already gives us, no new identity scheme
+needed.
+
+**Why this is framed as an authorization control, not infrastructure
+hygiene:** infrastructure-level rate limiting exists to protect a
+*process* from being overwhelmed, and would be satisfied by any
+reasonable key including IP. This limiter exists to stop an attack
+*class* — the gate has no other check that catches "technically valid
+mandate, technically valid transaction, submitted correctly 3,000
+times in a minute" — check g. (replay/claim) stops a *second* use of
+the same nonce, but a looping agent that keeps constructing (or is
+handed) fresh, individually-valid single-use tokens, or keeps hammering
+the same AP2 mandate's `NEEDS_HUMAN` threshold, isn't replaying
+anything; it's just going too fast for a human-paced process to be
+what's actually driving it. That is a policy question about acceptable
+request *rate* per authorized party, not a request *shape* question,
+which is why it belongs conceptually next to the other authorization
+controls even though it's implemented outside `evaluate()`.
+
+**Why it still sits outside `evaluate()` rather than becoming check
+h.:** `evaluate()`'s checks are all deterministic given the mandate and
+transaction content (check b., expiry, already depends on wall-clock
+time, but only in the sense of "has this timestamp passed," which is
+still a pure function of `(mandate, now)`). Rate limiting depends on
+*history* — how many prior requests this same pair has made
+recently — which is exactly the kind of engine-external state
+`nonce_store.py` already keeps separate from `evaluate()`'s own
+parameters. Keeping it in `api.py`, ahead of `service.authorize()`,
+also gives it the distinct HTTP semantics it needs (429, not 403) for
+free, without teaching `Decision`/`Outcome` a fourth state that isn't
+really a policy outcome at all.
+
+**Why it's per-process, not coordinated across instances:** same
+explicitly-named scope limit as the nonce store and approval queue
+(decision #4 and the open items) — this is Stage 1 (single instance,
+correct), not Stage 2/3 (`docs/SCALING.md`). A horizontally-scaled
+deployment would need a shared counter (Redis, most likely) for this to
+mean the same thing across instances; named as designed-not-built, same
+as everywhere else this limitation applies.
+
 ## Open items
 
 - **Multi-instance replay protection isn't solved** — this is
