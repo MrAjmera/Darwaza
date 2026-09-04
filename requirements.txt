@@ -1,6 +1,7 @@
 pydantic==2.9.2
 pytest==8.3.3
 cryptography==43.0.3
+portalocker==4.3.0
 
 # Optional — only needed if you configure the corresponding env vars.
 # The test suite and the CLI's fallback paths run without either of

@@ -16,6 +16,7 @@ simulate.py — rather than living only as unit-level DENY assertions.
 
 from datetime import datetime, timedelta, timezone
 
+from _fakes import FakeNonceClaimer
 from darwaza import keys
 from darwaza.policy_engine import evaluate
 from darwaza.schema import NormalizedMandate, ProposedTransaction
@@ -44,7 +45,7 @@ def test_attack_forged_signature_is_denied():
     )
     tx = ProposedTransaction(merchant_id="merchant-a", amount=50.0)
 
-    result = evaluate(m, tx, seen_nonces=set())
+    result = evaluate(m, tx, nonce_claimer=FakeNonceClaimer())
     assert result.outcome == "DENY"
     assert result.failed_check == "signature"
 
@@ -65,11 +66,11 @@ def test_attack_replayed_mandate_is_denied():
     tx = ProposedTransaction(merchant_id="merchant-a", amount=50.0)
 
     # First use: legitimately allowed.
-    first = evaluate(m, tx, seen_nonces=set())
+    first = evaluate(m, tx, nonce_claimer=FakeNonceClaimer())
     assert first.outcome == "ALLOW"
 
     # Attacker replays the same mandate_id after it's already been marked used.
-    second = evaluate(m, tx, seen_nonces={"replay-me"})
+    second = evaluate(m, tx, nonce_claimer=FakeNonceClaimer(["replay-me"]))
     assert second.outcome == "DENY"
     assert second.failed_check == "replay"
 
@@ -91,7 +92,7 @@ def test_attack_expired_mandate_is_denied():
     )
     tx = ProposedTransaction(merchant_id="any-merchant", amount=100.0, category="electronics")
 
-    result = evaluate(m, tx, seen_nonces=set())
+    result = evaluate(m, tx, nonce_claimer=FakeNonceClaimer())
     assert result.outcome == "DENY"
     assert result.failed_check == "expiry"
 
@@ -112,7 +113,7 @@ def test_attack_mandate_scoped_to_merchant_a_used_at_merchant_b_is_denied():
     )
     tx = ProposedTransaction(merchant_id="merchant-b", amount=50.0)
 
-    result = evaluate(m, tx, seen_nonces=set())
+    result = evaluate(m, tx, nonce_claimer=FakeNonceClaimer())
     assert result.outcome == "DENY"
     assert result.failed_check == "merchant_match"
 
@@ -135,7 +136,7 @@ def test_attack_cap_exceeding_request_is_denied():
     )
     tx = ProposedTransaction(merchant_id="any-merchant", amount=1000.01, category="electronics")
 
-    result = evaluate(m, tx, seen_nonces=set())
+    result = evaluate(m, tx, nonce_claimer=FakeNonceClaimer())
     assert result.outcome == "DENY"
     assert result.failed_check == "amount_cap"
 

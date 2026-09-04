@@ -22,14 +22,23 @@ from darwaza.schema import Decision, NormalizedMandate, Outcome, ProposedTransac
 HUMAN_REVIEW_FRACTION_OF_CAP = 0.5
 
 
-class NonceRegistry(Protocol):
-    """Structural type for `seen_nonces`: anything supporting membership
-    testing. Both a plain `set[str]` (tests) and `nonce_store.NonceStore`
-    (the CLI, persistent) satisfy this — `evaluate()` never calls `.add()`
-    itself, only the caller does, after a successful ALLOW, so `add` is
-    deliberately not part of this protocol."""
+class NonceClaimer(Protocol):
+    """Structural type for the nonce registry evaluate() claims against.
 
-    def __contains__(self, mandate_id: str) -> bool: ...
+    `claim(mandate_id) -> bool` must be a single atomic operation: True
+    if *this* call is the one that reserved `mandate_id` (it was not
+    already spent), False if someone else already claimed it. Both
+    `nonce_store.NonceStore.claim()` (the CLI, persistent, backed by a
+    SQLite PRIMARY KEY constraint) and a test double implementing the
+    same atomic claim-once contract satisfy this.
+
+    This replaces the old `NonceRegistry` protocol (a read-only
+    `__contains__`, with the caller responsible for calling `.add()`
+    afterward) — see DECISIONS.md for why fusing "check" and "claim"
+    into one atomic call is necessary, and why that means `evaluate()`
+    stops being a pure function as of this change."""
+
+    def claim(self, mandate_id: str) -> bool: ...
 
 
 def verify_signature(mandate: NormalizedMandate) -> bool:
@@ -51,21 +60,52 @@ def verify_signature(mandate: NormalizedMandate) -> bool:
 def evaluate(
     mandate: NormalizedMandate,
     proposed_tx: ProposedTransaction,
-    seen_nonces: NonceRegistry,
+    nonce_claimer: NonceClaimer,
 ) -> Decision:
     """Run the mandate through every check in order, stopping at the first
-    DENY or NEEDS_HUMAN. `seen_nonces` is passed in explicitly (rather
-    than being module-level state) so `evaluate` stays a pure function —
-    no hidden mutation, callers own the registry and its lifetime, and
-    its persistence (in-memory `set()` vs. `nonce_store.NonceStore`) is
-    entirely the caller's choice — this function only ever reads it.
+    DENY. `nonce_claimer` is passed in explicitly (rather than being
+    module-level state) so callers own the registry and its lifetime, and
+    its persistence (an in-memory test double vs. `nonce_store.NonceStore`)
+    is entirely the caller's choice.
+
+    `evaluate()` is no longer a pure function: check g. below calls
+    `nonce_claimer.claim()`, which mutates the claimer. That is
+    deliberate — see DECISIONS.md's entry on this change. What's
+    unchanged is *why* purity mattered in the first place: every branch
+    here is still a plain, reproducible rule computed the same way every
+    time from the same inputs, so the decision itself is exactly as
+    deterministic and auditable as before. Determinism of the rules was
+    always the actual goal; "no side effects" was one way to get there
+    that stopped being compatible with closing D1 (see DECISIONS.md).
 
     This is the only place in the system allowed to produce NEEDS_HUMAN
-    (see check g. and DECISIONS.md #5) — every branch here is a plain,
+    (see check f. and DECISIONS.md #5) — every branch here is a plain,
     reproducible rule. No model is called anywhere in this function; if
     an LLM-generated explanation is attached to a NEEDS_HUMAN decision,
     that happens strictly after this function returns, never inside it
     (DECISIONS.md #2).
+
+    Check order, and why it's load-bearing:
+
+    0. Amount validity — before anything else, including the mandate's
+       own signature (see the comment at that check for why proposed_tx
+       doesn't need the mandate to be trusted first).
+    a-f. Signature, expiry, merchant match, amount cap, category scope,
+       human review threshold — every one of these can DENY (or, for f.
+       only, route to NEEDS_HUMAN) without ever touching the nonce
+       registry. A malformed or out-of-policy mandate must be rejected
+       for free, as many times as an attacker cares to submit it.
+    g. Replay/claim — LAST, on purpose. This used to run third (see the
+       old check c.), which meant a mandate that was going to fail on
+       amount or category *still* consumed its nonce on the way out.
+       Once checking and claiming fuse into one atomic operation (this
+       stage's fix for D1), that ordering becomes a denial-of-service
+       primitive: an attacker who doesn't hold the principal's key can't
+       forge a valid mandate, but they *can* replay someone else's
+       legitimate mandate_id with an out-of-policy proposed_tx purely to
+       burn the nonce before the real principal gets to use it. Running
+       every other check first, and claiming only once we already know
+       the mandate would otherwise ALLOW or NEEDS_HUMAN, closes that.
     """
 
     # Amount validity comes before check a., not after it. proposed_tx is
@@ -76,10 +116,11 @@ def evaluate(
     # even a sane number. `proposed_tx.amount <= 0` alone is NOT a
     # sufficient guard: NaN is unordered, so `nan <= 0` is False and the
     # guard silently never fires — which is exactly how NaN (and 0.0 and
-    # every negative amount) previously reached check e. and check g.
-    # and satisfied both "not over the cap" and "not over the human-review
-    # threshold" at once. `math.isfinite()` rejects NaN and +/-inf
-    # explicitly, closing that gap. See DECISIONS.md.
+    # every negative amount) previously reached the amount cap and the
+    # human-review threshold checks and satisfied both "not over the cap"
+    # and "not over the human-review threshold" at once. `math.isfinite()`
+    # rejects NaN and +/-inf explicitly, closing that gap. See
+    # DECISIONS.md #8.
     if not math.isfinite(proposed_tx.amount) or proposed_tx.amount <= 0:
         return Decision(
             outcome=Outcome.DENY,
@@ -107,18 +148,7 @@ def evaluate(
             failed_check="expiry",
         )
 
-    # c. Replay protection: a mandate (especially a single-use ACP token)
-    #    must not be spent twice. We check membership, not just presence,
-    #    because the caller is expected to add the id to the set after a
-    #    successful ALLOW — evaluate() itself doesn't mutate seen_nonces.
-    if mandate.mandate_id in seen_nonces:
-        return Decision(
-            outcome=Outcome.DENY,
-            reason=f"Mandate {mandate.mandate_id} has already been used (replay).",
-            failed_check="replay",
-        )
-
-    # d. Merchant match only applies to ACP-style tokens, which bind to one
+    # c. Merchant match only applies to ACP-style tokens, which bind to one
     #    merchant. AP2-style mandates express intent without naming a
     #    merchant, so there's nothing to compare here — skip, don't fail.
     if mandate.merchant_id is not None:
@@ -132,7 +162,7 @@ def evaluate(
                 failed_check="merchant_match",
             )
 
-    # e. Amount cap: ACP tokens carry an exact amount (must match exactly —
+    # d. Amount cap: ACP tokens carry an exact amount (must match exactly —
     #    the token was issued for one specific purchase, not "up to").
     #    AP2 mandates carry a max_amount ceiling (transaction must be at or
     #    under it).
@@ -157,7 +187,7 @@ def evaluate(
                 failed_check="amount_cap",
             )
 
-    # f. Category scope only applies to AP2-style mandates — ACP tokens
+    # e. Category scope only applies to AP2-style mandates — ACP tokens
     #    never stated a category, so there's nothing to check it against.
     if mandate.category_scope is not None:
         if proposed_tx.category not in mandate.category_scope:
@@ -170,17 +200,19 @@ def evaluate(
                 failed_check="category_scope",
             )
 
-    # g. Human review threshold (AP2-style mandates only): a mandate that
+    # f. Human review threshold (AP2-style mandates only): a mandate that
     #    structurally passed every check above still isn't necessarily
     #    safe to auto-approve if the request consumes most of the
     #    mandate's ceiling in one shot. ACP-style tokens are exact-amount
     #    and single-use — there's no "fraction of a ceiling" concept for
     #    them, so they never reach this branch (mandate.max_amount is
-    #    None for a pure ACP token).
+    #    None for a pure ACP token). This only decides what the outcome
+    #    *would be* — the nonce isn't claimed until check g., below.
+    needs_human_decision: Decision | None = None
     if mandate.max_amount is not None and mandate.exact_amount is None:
         if proposed_tx.amount > HUMAN_REVIEW_FRACTION_OF_CAP * mandate.max_amount:
             fraction = proposed_tx.amount / mandate.max_amount
-            return Decision(
+            needs_human_decision = Decision(
                 outcome=Outcome.NEEDS_HUMAN,
                 reason=(
                     f"Transaction amount {proposed_tx.amount} is {fraction:.0%} of "
@@ -190,6 +222,24 @@ def evaluate(
                 ),
                 failed_check="human_review_threshold",
             )
+
+    # g. Replay/claim — LAST, and atomic. Every check above has already
+    #    passed (or produced a tentative NEEDS_HUMAN); only now do we
+    #    reserve the nonce, in the same operation as checking it. A
+    #    mandate that reaches here is either about to ALLOW or about to
+    #    NEEDS_HUMAN — both outcomes mean this mandate_id is spoken for
+    #    and must never be claimable again (see DECISIONS.md #9 for why
+    #    NEEDS_HUMAN reserves too, and this stage's DECISIONS.md entry for
+    #    why the claim itself had to become atomic and move here).
+    if not nonce_claimer.claim(mandate.mandate_id):
+        return Decision(
+            outcome=Outcome.DENY,
+            reason=f"Mandate {mandate.mandate_id} has already been used (replay).",
+            failed_check="replay",
+        )
+
+    if needs_human_decision is not None:
+        return needs_human_decision
 
     return Decision(
         outcome=Outcome.ALLOW,

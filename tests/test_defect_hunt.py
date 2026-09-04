@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from pydantic import ValidationError
 
+from _fakes import FakeNonceClaimer
 from darwaza import keys
 from darwaza.approval_queue import ApprovalQueue
 from darwaza.audit_log import append_entry, verify_chain
@@ -89,7 +90,7 @@ def test_D5_evaluate_denies_non_finite_or_non_positive_amount(amount):
         merchant_id="m1", amount=amount, category="electronics"
     )
 
-    result = evaluate(mandate, tx, set())
+    result = evaluate(mandate, tx, FakeNonceClaimer())
 
     assert result.outcome == Outcome.DENY
     assert result.failed_check == "invalid_amount"

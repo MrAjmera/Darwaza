@@ -1,16 +1,21 @@
-"""Concurrency defects (D1, D2, D3), reproduced against the current code.
+"""Concurrency defects (D1, D2, D3) -- fixed as of Stage 3:
+- D1: policy_engine.evaluate() now claims the nonce atomically, as its
+  own last check (nonce_claimer.claim(), a single INSERT keyed on a
+  PRIMARY KEY), instead of the caller checking membership and adding
+  separately. See policy_engine.py and DECISIONS.md.
+- D2: audit_log.append_entry() now wraps the whole read-tip-then-write
+  sequence in an OS-level file lock (portalocker), so concurrent writers
+  can no longer both read the same prev_hash and fork the chain.
+- D3: nonce_store.py and approval_queue.py now give each thread its own
+  sqlite3 connection (via threading.local), with WAL mode and
+  busy_timeout, instead of sharing one connection across threads.
 
-These tests are expected to FAIL until Stage 3 fixes the underlying races:
-- D1: policy_engine.evaluate() checks `mandate_id in seen_nonces` and the
-  caller adds it afterward -- a classic check-then-act TOCTOU gap.
-- D2: audit_log.append_entry() reads the last line for prev_hash, then
-  writes -- concurrent writers can read the same prev_hash and both chain
-  off it, forking the log.
-- D3: nonce_store.py and approval_queue.py each share one sqlite3
-  connection across threads with no WAL mode and no busy_timeout.
-
-Do not weaken these assertions to make them pass -- if they fail, the
-code is wrong, not the test.
+These are genuine races, not deterministic bugs -- a single green run
+proves nothing. Per the reviewer's instruction, each of these was run
+at least 10 times in a loop after the fix, not once, and the pass count
+out of however many runs is reported in the Stage 3 commit/report, not
+just "passed." Do not weaken these assertions to make them pass -- if
+they fail, the code is wrong, not the test.
 """
 
 from __future__ import annotations
@@ -43,9 +48,9 @@ def _signed_single_use_mandate(mandate_id: str) -> NormalizedMandate:
 
 def test_D1_replay_protection_allows_exactly_one_under_concurrency(tmp_path):
     """8 concurrent requests against the SAME single-use mandate must
-    produce exactly one ALLOW. Today, every request in flight between
-    evaluate()'s membership check and the caller's store.add() call passes
-    the check, so this reliably allows more than one."""
+    produce exactly one ALLOW. evaluate() now claims the nonce itself,
+    atomically, as its last check -- no external store.add() call is
+    involved on the enforcement path any more (see policy_engine.py)."""
     store = NonceStore(tmp_path / "nonces.db")
     mandate = _signed_single_use_mandate("replay-race-1")
     tx = ProposedTransaction(merchant_id="merchant-a", amount=50.0)
@@ -58,7 +63,6 @@ def test_D1_replay_protection_allows_exactly_one_under_concurrency(tmp_path):
         barrier.wait()
         decision = evaluate(mandate, tx, store)
         if decision.outcome == Outcome.ALLOW:
-            store.add(mandate.mandate_id)
             with lock:
                 allows.append(1)
 

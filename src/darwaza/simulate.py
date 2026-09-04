@@ -63,12 +63,11 @@ def _run(
 ) -> ScenarioResult:
     store = NonceStore(nonce_db_path)
     try:
+        # evaluate() claims the nonce itself now, atomically, as its
+        # last check, for both ALLOW and NEEDS_HUMAN. See cli.py's
+        # decide() and DECISIONS.md (D4, and Stage 3's atomic-claim fix
+        # for D1 — the old check-then-add pattern here was the race).
         decision = evaluate(mandate, proposed_tx, store)
-        if decision.outcome.value in ("ALLOW", "NEEDS_HUMAN"):
-            # Reserve on NEEDS_HUMAN too, not only ALLOW — a mandate
-            # flagged for human review is already spoken for. See
-            # cli.py's decide() for the same fix and DECISIONS.md (D4).
-            store.add(mandate.mandate_id)
     finally:
         store.close()
 

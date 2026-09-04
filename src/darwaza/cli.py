@@ -81,13 +81,10 @@ def decide(mandate_path: str, tx_path: str) -> None:
     mandate = NormalizedMandate.model_validate(_load(mandate_path))
     proposed_tx = ProposedTransaction.model_validate(_load(tx_path))
 
+    # evaluate() claims the nonce itself now, atomically, as its last
+    # step, for both ALLOW and NEEDS_HUMAN (see DECISIONS.md, Stage 3 —
+    # the old check-then-add pattern here was D1's TOCTOU race).
     decision = evaluate(mandate, proposed_tx, _SEEN_NONCES)
-    if decision.outcome in (Outcome.ALLOW, Outcome.NEEDS_HUMAN):
-        # A NEEDS_HUMAN mandate is spoken for the moment it's flagged, not
-        # only once a human eventually approves it — otherwise it stays
-        # claimable and can be resubmitted for as many separate pending
-        # approvals as someone cares to create. See DECISIONS.md (D4).
-        _SEEN_NONCES.add(mandate.mandate_id)
 
     _handle_result(mandate, proposed_tx, decision)
 
@@ -172,7 +169,12 @@ def _resolve(request_id: str, *, approved: bool) -> None:
     print(f"Audit log entry written to {DEFAULT_LOG_PATH} (chained to {entry['prev_hash'][:12]}...)")
 
     if approved:
-        _SEEN_NONCES.add(mandate.mandate_id)
+        # No _SEEN_NONCES.add() here: this mandate was already claimed
+        # when evaluate() first produced NEEDS_HUMAN for it (see
+        # decide()/simulate.py and DECISIONS.md, D4 and Stage 3) — a
+        # pending request in this queue is, by construction, already
+        # reserved. Re-adding here would just be re-confirming state
+        # that's already true.
         try:
             order = razorpay_client.create_order(
                 proposed_tx.amount, receipt=f"darwaza-{mandate.mandate_id}"

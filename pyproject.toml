@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 dependencies = [
     "pydantic==2.9.2",
     "cryptography==43.0.3",
+    "portalocker==4.3.0",
 ]
 
 [tool.setuptools.packages.find]

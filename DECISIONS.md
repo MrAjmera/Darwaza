@@ -305,13 +305,187 @@ version of D4 (proven by three separate CLI invocations, one after
 another) but not the concurrent version, which is Stage 3's
 `NonceStore.claim()` fix.
 
+## 10. evaluate() stops being a pure function: checking and claiming the
+    nonce fuse into one atomic operation, and the check moves last
+
+**Chosen:** `policy_engine.evaluate()`'s third parameter changed from
+`NonceRegistry` (`__contains__`-only, read-only) to `NonceClaimer`
+(`claim(mandate_id) -> bool`, a single atomic check-and-reserve). Replay
+protection is no longer "check `x in seen_nonces`, and trust the caller
+to separately call `.add()` after a successful ALLOW" — it's now
+`nonce_claimer.claim(mandate.mandate_id)`, called once, inside
+`evaluate()` itself, as the function's *last* check (moved from its old
+position third, right after expiry). `nonce_store.NonceStore.claim()`
+implements this as a single `INSERT`, relying on the `mandate_id`
+PRIMARY KEY constraint to reject a duplicate — the database itself is
+what makes the operation atomic, not application-level locking.
+
+**Rejected:** Keeping `evaluate()` pure and instead trying to fix D1 in
+the caller (e.g. wrapping the caller's check-then-add in a
+`threading.Lock`). This doesn't work: `cli.py` and `simulate.py` are
+separate, independently-invoked processes for every CLI command, so an
+in-process lock protects nothing across the process boundary a real
+replay attack would actually cross (see D1's original reproduction:
+separate threads, but the identical race exists across separate
+processes hitting a shared `nonces.db`). The fix has to live where the
+atomicity actually is: the database transaction.
+
+**Why decision #2's original purity choice was correct at the time,
+and why it stopped being sufficient:** decision #2 chose "no side
+effects, no hidden mutation" specifically to keep the *decision rules*
+reproducible and auditable — `evaluate()`'s callers, not `evaluate()`
+itself, were made responsible for persistence, so the same rule logic
+could be tested with a plain `set()` and deployed with a SQLite-backed
+store with zero changes to the function computing the rules. That
+reasoning held right up until "checking membership" and "reserving the
+nonce" needed to become *one* operation instead of two — at that point,
+"evaluate() never mutates anything" and "replay protection is atomic"
+became mutually exclusive, and D1 is what happens when you pick the
+former. Purity was a means to an end (rules that are reproducible,
+explainable by exact rule, and testable without a database); it was
+never the actual goal. The actual goal — every check being a plain,
+deterministic rule computed the same way from the same inputs, with no
+model and no ambiguity in what triggers it — is completely unchanged
+by this: `claim()`'s *result* (True/False) still deterministically
+follows from state that's either already committed or not; nothing
+about the decision became probabilistic or judgment-based. What changed
+is where that state lives and how it's touched, not what governs the
+decision.
+
+**Why replay had to move from check c. to last (now check g.):** once
+"check" and "claim" fuse into one call, running that call in the
+*middle* of `evaluate()` (its old position, before merchant/amount/
+category) would mean a mandate that was always going to fail on, say,
+amount_cap still consumes its nonce on the way to that DENY. That
+converts replay protection into a denial-of-service primitive: an
+attacker who cannot forge a signature can still replay someone else's
+*legitimate* `mandate_id` attached to a deliberately out-of-policy
+`proposed_tx`, purely to burn the real principal's nonce before they
+get to use it — a free, un-forgeable way to invalidate someone else's
+mandate. Running every other check first, and claiming only once the
+mandate is already known to end in ALLOW or NEEDS_HUMAN, means a
+mandate can only ever consume its one legitimate use — never be
+sacrificed by an attacker on a request that was never going to succeed
+anyway.
+
+**What this closes vs. what it doesn't:** this closes D1 for real,
+including across separate processes (not just threads) — verified with
+50 concurrent threads x 15 runs (recorded in the Stage 3 report),
+consistently exactly one ALLOW. It does not change the multi-instance
+scope limit named in decision #4 and the open items: one SQLite file
+is still one instance's store; two *separate* merchant deployments each
+running their own `nonces.db` are (correctly) not coordinated with each
+other, because they were never meant to be the same store.
+
+## 11. Audit log concurrency: an OS-level lock plus an in-memory tip
+    cache, not a database
+
+**Chosen:** `audit_log.append_entry()` wraps its read-tip-then-write
+sequence in a `portalocker.Lock` on a sidecar `<file>.lock`, and caches
+each log file's `(seq, hash)` tip in memory after the first read so
+later appends in the same process don't re-scan the whole file. Each
+entry now also carries an explicit `seq` integer.
+
+**Rejected:** Moving the audit log into SQLite (consistent with
+`nonce_store.py`/`approval_queue.py`), or using `fcntl` for the file
+lock.
+
+**Why not SQLite here, when it was the right call for the nonce store
+and approval queue:** those two are *reservation* systems — the thing
+that matters is "has this id already been claimed," a query SQLite's
+transactional guarantees answer for free. The audit log's job is
+different: it's an external, human/dispute-facing artifact whose value
+partly comes from being a plain, greppable, append-only text file
+(JSONL) that doesn't require a SQLite client to inspect during a
+dispute. Moving it into SQLite would solve the concurrency problem too,
+but at the cost of the format decision this project already made and
+never revisited — not worth relitigating just to reuse one mechanism
+everywhere.
+
+**Why `portalocker` and not bare `fcntl`:** `fcntl` doesn't exist on
+Windows, and this system runs on Windows (see the environment notes in
+this repo). `portalocker` wraps the platform-appropriate primitive
+(`msvcrt.locking` on Windows, `fcntl.flock` on POSIX) behind one API,
+so the same code path is what's actually tested here.
+
+**Why a sidecar lock file instead of locking `audit_log.jsonl`
+itself:** a reader (`verify_chain()`, a human tailing the file, this
+project's own `docs/LLD.md` dispute-reconstruction story) should never
+have to contend with a writer's lock just to read a file that's
+supposed to be append-only and safe to read at any time. Locking a
+separate `<file>.lock` guards only the critical section that actually
+needs serializing — computing the next `seq`/`prev_hash` and appending
+— without making reads block on it.
+
+**Why the in-memory tip cache is safe to assume single-process:** this
+matches the same "one file for one instance" scope already named for
+`nonce_store.py` and `approval_queue.py` (decision #4, open items). If
+two processes ever appended to the same log file, this process's cache
+could go stale relative to what the other process wrote, and its next
+append would chain off the wrong tip — but `verify_chain()` would
+(correctly, by design) report exactly that as a break, so the failure
+mode is "loudly detected," not "silently wrong."
+
+## 12. SQLite concurrency: one connection per thread, not one shared
+    connection with `check_same_thread=False`
+
+**Chosen:** `nonce_store.NonceStore` and `approval_queue.ApprovalQueue`
+each give every thread that touches them its own `sqlite3.Connection`
+(via `threading.local`), with `PRAGMA journal_mode=WAL` and
+`PRAGMA busy_timeout=5000` set on each connection. `check_same_thread`
+is still passed as `False` on each of those per-thread connections —
+but only so a coordinating thread can `close()` them all during cleanup
+after their owning threads are done; no two threads ever operate on the
+same connection concurrently, which is what actually caused D3.
+
+**Rejected:** Keeping one shared connection with
+`check_same_thread=False` and just adding WAL mode / `busy_timeout` on
+top of it.
+
+**Why the shared connection was the actual defect, not just missing
+pragmas:** a `sqlite3.Connection` object tracks its own implicit
+transaction state in the Python DB-API layer. When multiple threads
+issue `execute()`/`commit()` against the *same* connection object
+without external synchronization, their transaction boundaries
+interleave — thread A's implicit transaction can get committed by
+thread B's `commit()` call, or thread B can try to commit a transaction
+thread A already closed. That's exactly what produced
+`"cannot start a transaction within a transaction"` and
+`"cannot commit — no transaction is active"`: not lock contention on
+the database file (which WAL/`busy_timeout` would fix), but confused
+in-process bookkeeping about whose transaction is whose.
+`check_same_thread=False` didn't cause this — it only removed the
+guardrail that would have raised a clear error the moment a second
+thread touched the connection, which is precisely why D3 surfaced as
+data-layer chaos instead of an obvious, early `ProgrammingError`.
+
+**Why WAL mode and `busy_timeout` are still added, given one-connection-
+per-thread already fixes the interleaving:** they solve a different,
+real problem — once every thread has its own connection, those
+connections *do* still contend for the database file itself (SQLite
+allows only one writer at a time by default). WAL mode lets readers
+proceed without blocking on a writer; `busy_timeout` makes a writer that
+loses a brief lock race wait and retry instead of raising
+`OperationalError` immediately. Both together are what make 20
+concurrent threads each getting their own connection actually succeed,
+rather than just fail with a *different*, more honest-looking error.
+
 ## Open items
 
-- **Multi-instance replay protection isn't solved.** A single SQLite
-  file is correct for one process/one merchant instance, but doesn't
-  coordinate across multiple concurrent instances (e.g. horizontally
-  scaled) the way a shared service (Redis, a real DB) would. The
-  approval queue has the identical limitation, for the identical reason.
+- **Multi-instance replay protection isn't solved** — this is
+  specifically about multiple *separate processes/instances* sharing
+  load (e.g. horizontally scaled behind a load balancer), not about
+  concurrency within one instance. Concurrent access *within* one
+  process/one SQLite file — many threads, many requests against one
+  running instance — is solved as of Stage 3 (decisions #10-#12): an
+  atomic `claim()`, WAL mode, `busy_timeout`, and per-thread
+  connections together closed D1/D2/D3, verified under repeated
+  concurrent-load test runs (see the Stage 3 report/commit for pass
+  counts). What remains unsolved is coordination *across* multiple
+  separate SQLite files/instances, which only a shared service (Redis,
+  a real DB) would provide — see `docs/SCALING.md` for the designed,
+  not-built path there. The approval queue has the identical remaining
+  limitation, for the identical reason.
 - **Key management is out of scope.** One hardcoded keypair stands in for
   every principal (see decision 3 above) — no registration, issuance, or
   rotation flow exists.
