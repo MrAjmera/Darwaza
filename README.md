@@ -12,10 +12,13 @@ step-by-step account of how it was built.
 ## What's real vs. what's scoped out
 
 **Real:** normalized mandate schema (AP2 and ACP asymmetry preserved,
-not papered over), a pure deterministic policy engine (6 checks, zero
-LLM calls in the enforcement path), real Ed25519 signature verification,
-persistent SQLite-backed replay detection, a hash-chained tamper-evident
-audit log, a buyer-agent simulator with a real (not just unit-tested)
+not papered over), a pure deterministic policy engine (7 checks, zero
+LLM calls in the enforcement path), real Ed25519 signature verification
+that is genuinely per-principal (each registered principal has their own
+keypair, so a signature is checked against *that specific principal's*
+key, not just "some key the system trusts" — see below), persistent
+SQLite-backed replay detection, a hash-chained tamper-evident audit log,
+a buyer-agent simulator with a real (not just unit-tested)
 poisoned-catalog attack, an LLM explainer that is structurally unable to
 influence a decision, a human approval queue whose "approved" and
 "executed" are two separately-tracked states (not one that quietly means
@@ -24,13 +27,15 @@ retry/timeout/idempotency-by-receipt behavior so a transient failure is
 retryable rather than lost.
 
 **Explicitly out of scope**, named directly rather than hidden: key
-management/rotation (one hardcoded demo keypair stands in for every
-principal), multi-instance coordination (the nonce store and approval
-queue are each a single SQLite file), a full payment round-trip without
-a frontend (Razorpay integration stops at order creation), and a tuned
-risk model behind the 0.5 human-review threshold (it's a defensible
-round number, not derived from data). See DECISIONS.md's "Open items"
-for the complete list.
+*management* (registration, issuance, rotation, revocation — see
+DECISIONS.md #18 for the precise line: verification is per-principal
+now, but the registry is still a small hardcoded dict of three demo
+principals, not a KMS), multi-instance coordination (the nonce store and
+approval queue are each a single SQLite file), a full payment round-trip
+without a frontend (Razorpay integration stops at order creation), and a
+tuned risk model behind the 0.5 human-review threshold (it's a
+defensible round number, not derived from data). See DECISIONS.md's
+"Open items" for the complete list.
 
 ## Setup
 

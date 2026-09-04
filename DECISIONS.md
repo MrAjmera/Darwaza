@@ -804,6 +804,131 @@ serialized retries via `execute_approval()`), but it's not a guarantee
 Razorpay's API makes on its own — naming that honestly rather than
 overstating what the receipt lookup proves.
 
+## 18. Signature verification is per-principal, keyed by a small
+    in-code registry — key management stays explicitly out of scope
+
+**Chosen:** `keys.py`'s single hardcoded Ed25519 keypair (decision #3)
+is replaced with a small registry — `_PRIVATE_KEYS`/`PUBLIC_KEYS`,
+`dict[str, Ed25519PrivateKey | Ed25519PublicKey]` keyed by
+`principal_id` — seeded with three demo principals
+(`user-krishna`, `p1`, `p2`). `sign(principal_id, message)` signs with
+that principal's own key (and raises `KeyError` for an unregistered one
+— a fixture-building mistake, never a call on the enforcement path,
+should fail loudly and immediately, not produce a signature that's
+silently meaningless). `verify(principal_id, message, signature_b64)`
+checks the signature against *only that principal's* registered public
+key, returning False (not raising) for an unregistered principal — same
+"fail closed, don't crash" contract as before, just now parameterized by
+identity. `policy_engine.evaluate()` gained a new check, a0, running
+*before* the signature check it sits next to: `mandate.principal_id not
+in keys.PUBLIC_KEYS` DENIES immediately with a new, distinct
+`failed_check="unknown_principal"`, so "we have no key for this
+principal at all" is distinguishable in the audit trail from
+"registered principal, wrong signature" (`failed_check="signature"`,
+check a., unchanged in meaning, now parameterized by principal).
+`verify_signature()` now calls `keys.verify(mandate.principal_id, ...)`
+instead of the old zero-argument `keys.verify(...)`.
+
+**Rejected:** Leaving the single shared keypair in place and treating
+this as accepted risk (the *point* of this stage is that "key management
+is entirely absent" was hiding a sharper problem than its own docstring
+admitted — see "Why this was worth fixing now," below); building a real
+registration/enrollment API so new principals could be provisioned a key
+at runtime; persisting the registry anywhere outside this one file (a
+database table, a config file loaded at startup); any KMS/HSM/external
+key-management integration. All four are explicitly out of scope for
+this stage, not oversights — see "What stays out of scope," below.
+
+**Why this was worth fixing now, not left as accepted risk:** the old
+single-keypair setup didn't just mean "no rotation, no registration" (an
+honestly-named absence, decision #3's own framing) — it meant
+`verify_signature()` could only ever prove "this mandate was signed by
+*a* key this system trusts," never "principal p1 specifically signed
+this, and not principal p2," because every principal shared the same
+key and the signature check was never tied to the `principal_id` field
+it was supposedly authenticating. Proven directly, empirically, against
+the pre-fix code (not just argued): a brand-new mandate, freshly and
+fully signed end to end with the one shared key, claiming `principal_id
+= "p2"`, verified cleanly — and so did an otherwise-identical mandate
+claiming `principal_id = "p3"` instead, with the exact same signing
+operation. "Signed by p2's key" and "signed by the one key everyone
+effectively has" were indistinguishable, because they were the same
+key. See `tests/test_attacks.py`'s
+`test_attack_forged_principal_id_signed_by_a_different_principals_key_
+is_denied` for the permanent regression version, now proving the
+*opposite* result under the fixed code.
+
+**Why this is NOT the same attack as tampering an already-signed
+mandate's `principal_id` field afterward:** that specific tamper was
+never actually exploitable, before or after this stage —
+`schema.signing_payload()` already includes `principal_id` in the bytes
+a signature is computed over (decision on `signing_payload()`, unchanged
+here), so mutating it post-signature always changes the signed bytes and
+breaks the signature, regardless of whether the system has one shared
+key or many per-principal ones. The real gap this stage closes is
+narrower and sharper than "field tampering": it's that *minting a
+brand-new, internally-consistent, validly-signed mandate under someone
+else's claimed identity* required no special access to that identity's
+key, because there was no such thing as an identity's own key. Worth
+naming precisely, since the imprecise version ("attacker flips
+principal_id and keeps the old signature") is a materially easier attack
+to defend against and was never actually the live one.
+
+**Why `verify()` treats an unregistered principal as "verification
+fails" rather than raising, while `sign()` raises for the same
+condition:** asymmetric on purpose, not an inconsistency. `verify()` sits
+on the enforcement path — every mandate this system has ever seen, real
+or attacker-supplied, eventually reaches it, and an unrecognized
+principal is exactly as untrustworthy as a wrong signature; both mean
+"nothing to trust here," so both fail closed the same way (return False,
+never throw), matching the "malformed input must DENY, never crash the
+gateway" rule this file has held since decision #3. `sign()` is a
+fixture/test/simulator helper, never called by anything on the
+enforcement path — a typo'd `principal_id` passed to it is a bug in the
+caller (a test, `simulate.py`), and should surface immediately and
+loudly as a `KeyError` at fixture-build time, not silently produce a
+signature that only turns out to be meaningless once something tries to
+verify it later.
+
+**Why `unknown_principal` is checked before, not folded into, the
+signature check:** an unregistered principal has no key to check the
+signature against *at all* — there's no meaningful sense in which its
+signature is "wrong" the way a registered principal's mismatched
+signature is; there's simply nothing to compare against. Giving that
+case its own `failed_check` value, checked first, means an audit-log
+reader (or a panel reviewing the logs) can tell "this principal doesn't
+exist in our registry" apart from "this principal exists and the
+signature doesn't match" — two different findings that call for two
+different follow-ups (the first says "who is this and why are they
+transacting at all"; the second says "this specific signature is
+forged/corrupted"). Folding both into one `signature` failure would
+erase that distinction for no benefit.
+
+**What stays explicitly out of scope** — this is the sentence that
+matters if asked "so is key management solved now": **this fix moves the
+honest scope boundary from "key management is entirely absent" to "key
+verification is correctly scoped to per-principal demo keys; key
+management (issuance, rotation, revocation) remains out of scope."**
+Concretely, still not here, on purpose:
+- **No rotation.** A principal's key is fixed for the life of `keys.py`;
+  there is no "old key still valid during a grace period" concept.
+- **No registration/enrollment flow.** Adding a fourth principal means
+  editing `keys.py` and redeploying, not an API call that provisions one
+  at runtime. That's the actual line between "a demo registry" and "a
+  KMS," and it's still true after this fix — this stage makes the
+  registry *correct* for the principals it already knows about, not
+  *dynamic*.
+- **No persistence beyond this one file.** No database table, no config
+  file loaded at startup — three hardcoded principals, same spirit as
+  the single keypair this replaces, just no longer fictional about who
+  it authenticates.
+- **No KMS/HSM/external key-management integration of any kind.**
+- Private keys are still checked into source control, on purpose, for
+  the identical reason as decision #3: these are demo keypairs with no
+  value outside this repo, and inlining them is what makes the test
+  suite and CLI demo runnable by anyone who clones the repo with no
+  setup step. Never acceptable for a real signing key.
+
 ## Open items
 
 - **Multi-instance replay protection isn't solved** — this is
@@ -820,9 +945,14 @@ overstating what the receipt lookup proves.
   a real DB) would provide — see `docs/SCALING.md` for the designed,
   not-built path there. The approval queue has the identical remaining
   limitation, for the identical reason.
-- **Key management is out of scope.** One hardcoded keypair stands in for
-  every principal (see decision 3 above) — no registration, issuance, or
-  rotation flow exists.
+- **Key management is out of scope.** As of Stage 7 (decision #18), this
+  item is narrower than it used to be: verification is now correctly
+  scoped per-principal (three hardcoded demo keypairs, one per
+  registered principal — see decision #18), not "one keypair for
+  everyone" (decision #3's original state). What's still out of scope,
+  unchanged: no registration/enrollment flow (adding a principal means
+  editing `keys.py`, not calling an API), no rotation, no persistence
+  beyond that one file, no KMS/HSM.
 - **The 0.5 human-review threshold is a placeholder**, not a tuned risk
   model (see decision #5). Naming this directly rather than presenting
   0.5 as considered.

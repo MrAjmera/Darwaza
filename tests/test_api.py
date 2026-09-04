@@ -49,7 +49,9 @@ def _signed_mandate_dict(mandate_id: str, **overrides) -> dict:
     )
     defaults.update(overrides)
     mandate = NormalizedMandate.model_validate(defaults)
-    signed = mandate.model_copy(update={"signature": keys.sign(mandate.signing_payload())})
+    signed = mandate.model_copy(
+        update={"signature": keys.sign(mandate.principal_id, mandate.signing_payload())}
+    )
     return signed.model_dump(mode="json")
 
 

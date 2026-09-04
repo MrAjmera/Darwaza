@@ -26,7 +26,9 @@ PAST = datetime.now(timezone.utc) - timedelta(days=1)
 
 
 def _signed(mandate: NormalizedMandate) -> NormalizedMandate:
-    return mandate.model_copy(update={"signature": keys.sign(mandate.signing_payload())})
+    return mandate.model_copy(
+        update={"signature": keys.sign(mandate.principal_id, mandate.signing_payload())}
+    )
 
 
 def test_attack_forged_signature_is_denied():
@@ -48,6 +50,105 @@ def test_attack_forged_signature_is_denied():
     result = evaluate(m, tx, nonce_claimer=FakeNonceClaimer())
     assert result.outcome == "DENY"
     assert result.failed_check == "signature"
+
+
+def test_attack_forged_principal_id_signed_by_a_different_principals_key_is_denied():
+    """Stage 7's fix, proven directly: before it, every principal shared
+    ONE demo keypair, so `keys.verify()` could only ever prove "signed by
+    the one key the whole system trusts" — it had no way to prove
+    "signed by principal p2's *own* key specifically." A brand-new
+    mandate, freshly and fully signed end to end, claiming any
+    principal_id at all, verified fine — "signed by p2's key" and
+    "signed by the one key everyone effectively shares" were the exact
+    same operation (proven directly against the pre-fix code before
+    this fix landed: see DECISIONS.md's Stage 7 entry). This is a
+    materially different, and more serious, gap than "an already-signed
+    mandate gets its principal_id field tampered afterward" — that
+    specific tamper was already caught before this stage, because
+    schema.signing_payload() includes principal_id in the signed bytes,
+    so changing it post-signature always broke the hash regardless of
+    key-sharing.
+
+    Here: a mandate claims principal_id="p2", but whoever produced the
+    signature over that exact payload only had p1's private key (not
+    p2's) — e.g. an attacker (or a compromised agent acting for p1) who
+    wants a transaction to look like it came from p2 instead. Now that
+    each principal has a distinct registered key (darwaza.keys), this
+    must DENY on the signature check: p1's signature does not verify
+    against p2's registered public key, no matter how internally
+    consistent the rest of the mandate is.
+    """
+    forged_as_p2 = NormalizedMandate(
+        mandate_id="forge-as-p2",
+        principal_id="p2",
+        expiry=FUTURE,
+        signature="placeholder",
+        merchant_id="merchant-a",
+        exact_amount=50.0,
+    )
+    # Signed with p1's key, not p2's -- p1 has no relationship to p2's
+    # identity, and under the old single-key scheme this distinction
+    # couldn't even be expressed (there was only one key to sign with).
+    forged_as_p2 = forged_as_p2.model_copy(
+        update={"signature": keys.sign("p1", forged_as_p2.signing_payload())}
+    )
+    tx = ProposedTransaction(merchant_id="merchant-a", amount=50.0)
+
+    result = evaluate(forged_as_p2, tx, nonce_claimer=FakeNonceClaimer())
+
+    assert result.outcome == "DENY"
+    assert result.failed_check == "signature"
+
+
+def test_attack_a_principals_own_correctly_signed_mandate_still_allows():
+    """The happy path the fix above must not break: a mandate signed by
+    principal p1's own key, correctly claiming principal_id="p1", is
+    exactly what per-principal verification is supposed to let through —
+    proving the fix is scoped (denies mismatched principal/key pairs)
+    and not a blanket new failure (denies everything)."""
+    m = _signed(
+        NormalizedMandate(
+            mandate_id="own-key-1",
+            principal_id="p1",
+            expiry=FUTURE,
+            signature="unsigned-placeholder",
+            merchant_id="merchant-a",
+            exact_amount=50.0,
+        )
+    )
+    tx = ProposedTransaction(merchant_id="merchant-a", amount=50.0)
+
+    result = evaluate(m, tx, nonce_claimer=FakeNonceClaimer())
+
+    assert result.outcome == "ALLOW"
+
+
+def test_attack_unregistered_principal_is_denied_as_unknown_principal_not_signature():
+    """A mandate whose principal_id has no entry in darwaza.keys' demo
+    registry at all must DENY with its own distinct reason
+    ("unknown_principal"), not "signature" — the two mean genuinely
+    different things to whoever's reading the audit trail afterward: "we
+    don't know this principal" is a different, and more actionable,
+    finding than "we know this principal and their signature is wrong."
+    See keys.py and DECISIONS.md's Stage 7 entry. The signature bytes
+    here don't even matter for this outcome -- keys.PUBLIC_KEYS.get()
+    returns None for an unregistered principal regardless of what's in
+    the `signature` field, so evaluate() must never reach the signature
+    check at all for this mandate."""
+    m = NormalizedMandate(
+        mandate_id="ghost-principal-1",
+        principal_id="principal-that-was-never-registered",
+        expiry=FUTURE,
+        signature="doesnt-matter-not-even-valid-base64!!",
+        merchant_id="merchant-a",
+        exact_amount=50.0,
+    )
+    tx = ProposedTransaction(merchant_id="merchant-a", amount=50.0)
+
+    result = evaluate(m, tx, nonce_claimer=FakeNonceClaimer())
+
+    assert result.outcome == "DENY"
+    assert result.failed_check == "unknown_principal"
 
 
 def test_attack_replayed_mandate_is_denied():

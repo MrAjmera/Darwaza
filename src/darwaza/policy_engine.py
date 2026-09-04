@@ -42,19 +42,35 @@ class NonceClaimer(Protocol):
 
 
 def verify_signature(mandate: NormalizedMandate) -> bool:
-    """Verify the mandate was signed, in full, by the demo principal
-    keypair (darwaza.keys) — i.e. that every field on it is exactly what
-    the principal signed, not a value an attacker added or changed
-    afterward.
+    """Verify the mandate was signed, in full, by `mandate.principal_id`'s
+    *own* registered demo keypair (darwaza.keys) — i.e. that every field
+    on it is exactly what that specific principal signed, not a value an
+    attacker added or changed afterward, and not a signature produced by
+    some other principal's key.
 
     `mandate.signing_payload()` re-derives the same canonical bytes the
-    signer produced; `keys.verify()` checks the signature against those
-    bytes with the public key. Any mismatch — wrong key, tampered field,
-    malformed signature — returns False here, which the caller turns into
-    a DENY. See DECISIONS.md: this was the last stubbed check in the
-    engine (previously always returned True).
+    signer produced; `keys.verify()` looks up `mandate.principal_id`'s
+    registered public key and checks the signature against those bytes
+    with *only that key*. Any mismatch — wrong/unregistered principal,
+    wrong key, tampered field, malformed signature — returns False here,
+    which the caller turns into a DENY.
+
+    As of Stage 7 (DECISIONS.md), this is genuinely per-principal: before
+    this stage every principal shared one demo keypair, so this check
+    only ever proved "signed by *a* key this system trusts," never "signed
+    by *this* principal's key" — a mandate signed for real but with its
+    principal_id field changed to claim a different principal passed
+    cleanly (see tests/test_attacks.py's forged-principal-id test). An
+    unregistered principal_id is handled by evaluate() itself, as its own
+    DENY reason (`failed_check="unknown_principal"`) *before* this
+    function is even called, so it can be told apart from "registered
+    principal, wrong signature" in the audit trail — see evaluate()'s
+    check a0. This function alone doesn't distinguish the two: an
+    unregistered principal simply has no key to check against and
+    `keys.verify()` returns False for it here too, same as a bad
+    signature would.
     """
-    return keys.verify(mandate.signing_payload(), mandate.signature)
+    return keys.verify(mandate.principal_id, mandate.signing_payload(), mandate.signature)
 
 
 def evaluate(
@@ -90,11 +106,21 @@ def evaluate(
     0. Amount validity — before anything else, including the mandate's
        own signature (see the comment at that check for why proposed_tx
        doesn't need the mandate to be trusted first).
-    a-f. Signature, expiry, merchant match, amount cap, category scope,
-       human review threshold — every one of these can DENY (or, for f.
-       only, route to NEEDS_HUMAN) without ever touching the nonce
-       registry. A malformed or out-of-policy mandate must be rejected
-       for free, as many times as an attacker cares to submit it.
+    a0-f. Unknown principal, signature, expiry, merchant match, amount
+       cap, category scope, human review threshold — every one of these
+       can DENY (or, for f. only, route to NEEDS_HUMAN) without ever
+       touching the nonce registry. A malformed or out-of-policy mandate
+       must be rejected for free, as many times as an attacker cares to
+       submit it.
+    a0. Unknown principal runs *before* the signature check it's
+       adjacent to, not after — a principal_id with no registered key
+       (Stage 7, darwaza.keys) has no key to check the signature
+       against at all, so there's nothing signature verification could
+       even attempt; this check exists so that case gets its own
+       specific DENY reason (`unknown_principal`) instead of being
+       folded into a generic `signature` failure that would tell an
+       audit-log reader "the signature was wrong" when the more precise
+       (and more actionable) truth is "we don't know this principal."
     g. Replay/claim — LAST, on purpose. This used to run third (see the
        old check c.), which meant a mandate that was going to fail on
        amount or category *still* consumed its nonce on the way out.
@@ -126,6 +152,22 @@ def evaluate(
             outcome=Outcome.DENY,
             reason=f"Transaction amount {proposed_tx.amount} is not a valid positive amount.",
             failed_check="invalid_amount",
+        )
+
+    # a0. Unknown principal: checked before the signature itself, and
+    #     with its own DENY reason, so "we have no registered key for
+    #     this principal at all" is distinguishable in the audit trail
+    #     from "we have this principal's key and the signature doesn't
+    #     match" (check a., below). Both ultimately mean "don't trust
+    #     this mandate," but only one of them means "this principal_id
+    #     isn't in our registry" — worth a panel/operator being able to
+    #     tell apart at a glance. See keys.py and DECISIONS.md's Stage 7
+    #     entry.
+    if mandate.principal_id not in keys.PUBLIC_KEYS:
+        return Decision(
+            outcome=Outcome.DENY,
+            reason=f"Principal '{mandate.principal_id}' is not a registered principal.",
+            failed_check="unknown_principal",
         )
 
     # a. Signature must be valid, or nothing else about the mandate can be

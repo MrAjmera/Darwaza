@@ -49,7 +49,7 @@ def _signed_ap2_mandate(mandate_id: str, **overrides) -> NormalizedMandate:
     )
     defaults.update(overrides)
     m = NormalizedMandate(**defaults)
-    return m.model_copy(update={"signature": keys.sign(m.signing_payload())})
+    return m.model_copy(update={"signature": keys.sign(m.principal_id, m.signing_payload())})
 
 
 # D5: proposed_tx.amount had no lower bound anywhere -- neither the

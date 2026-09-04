@@ -42,7 +42,9 @@ def _signed_mandate(mandate_id: str, **overrides) -> NormalizedMandate:
     )
     defaults.update(overrides)
     mandate = NormalizedMandate(**defaults)
-    return mandate.model_copy(update={"signature": keys.sign(mandate.signing_payload())})
+    return mandate.model_copy(
+        update={"signature": keys.sign(mandate.principal_id, mandate.signing_payload())}
+    )
 
 
 def _run(

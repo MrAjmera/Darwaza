@@ -43,7 +43,7 @@ def _signed_single_use_mandate(mandate_id: str) -> NormalizedMandate:
         merchant_id="merchant-a",
         exact_amount=50.0,
     )
-    return m.model_copy(update={"signature": keys.sign(m.signing_payload())})
+    return m.model_copy(update={"signature": keys.sign(m.principal_id, m.signing_payload())})
 
 
 def test_D1_replay_protection_allows_exactly_one_under_concurrency(tmp_path):

@@ -20,7 +20,9 @@ def _signed(mandate: NormalizedMandate) -> NormalizedMandate:
     signed mandate," which is what makes it a fair test of the *other*
     checks; tests for the signature check itself pass an explicit
     (invalid) `signature=` override instead, which skips this."""
-    return mandate.model_copy(update={"signature": keys.sign(mandate.signing_payload())})
+    return mandate.model_copy(
+        update={"signature": keys.sign(mandate.principal_id, mandate.signing_payload())}
+    )
 
 
 def ap2_mandate(**overrides) -> NormalizedMandate:
@@ -56,6 +58,26 @@ def tx(**overrides) -> ProposedTransaction:
     defaults = dict(merchant_id="merchant-a", amount=50.0, category="electronics")
     defaults.update(overrides)
     return ProposedTransaction(**defaults)
+
+
+# a0. unknown principal (Stage 7 — see darwaza.keys and DECISIONS.md)
+def test_unknown_principal_registered_principal_passes_this_check():
+    m = ap2_mandate(principal_id="p1")
+    result = evaluate(m, tx(amount=100), FakeNonceClaimer())
+    assert result.failed_check != "unknown_principal"
+
+
+def test_unknown_principal_unregistered_principal_fails_with_its_own_reason():
+    # signature="unsigned-placeholder" (never re-signed, since keys.sign()
+    # itself would raise for a principal_id with no registered keypair —
+    # see keys.sign()'s docstring) doesn't matter for this outcome:
+    # evaluate() must DENY on "unknown_principal" before it ever reaches
+    # the signature check, since there's no key to check the signature
+    # against in the first place.
+    m = ap2_mandate(principal_id="nobody-registered-this-principal", signature="unsigned-placeholder")
+    result = evaluate(m, tx(amount=100), FakeNonceClaimer())
+    assert result.outcome == "DENY"
+    assert result.failed_check == "unknown_principal"
 
 
 # a. signature
