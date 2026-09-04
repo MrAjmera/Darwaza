@@ -13,8 +13,7 @@ for those would be the same enforcement-path involvement DECISIONS.md
 
 from __future__ import annotations
 
-import os
-
+from darwaza import config
 from darwaza.schema import Decision, NormalizedMandate, ProposedTransaction
 
 _FALLBACK_TEMPLATE = (
@@ -40,7 +39,7 @@ def explain(
             f"Got outcome={decision.outcome.value}."
         )
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = config.ANTHROPIC_API_KEY
     if not api_key:
         return _fallback(mandate, proposed_tx, decision)
 

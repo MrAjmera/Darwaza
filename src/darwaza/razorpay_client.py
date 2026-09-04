@@ -3,15 +3,18 @@ NEEDS_HUMAN request (or a deterministic ALLOW). See DECISIONS.md #7 for
 what this honestly does and does not prove.
 
 Requires RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET (test-mode keys from
-the Razorpay dashboard: Settings -> API Keys) as environment variables.
-If they aren't set, create_order() raises immediately rather than
+the Razorpay dashboard: Settings -> API Keys), read from config.py. If
+they aren't set, create_order() raises immediately rather than
 pretending to succeed — a demo step that silently no-ops on a missing
-key is worse than one that fails loudly and says why.
+key is worse than one that fails loudly and says why. If RAZORPAY_KEY_ID
+*is* set but isn't a `rzp_test_...` key, this code never even runs —
+config.py refuses to let the process start at all (see config.py and
+DECISIONS.md's Stage 5 entry).
 """
 
 from __future__ import annotations
 
-import os
+from darwaza import config
 
 
 def create_order(amount_rupees: float, *, currency: str = "INR", receipt: str | None = None) -> dict:
@@ -29,8 +32,8 @@ def create_order(amount_rupees: float, *, currency: str = "INR", receipt: str | 
     decision actually reaches a real payment processor — not that a full
     payment round-trip happened headlessly.
     """
-    key_id = os.environ.get("RAZORPAY_KEY_ID")
-    key_secret = os.environ.get("RAZORPAY_KEY_SECRET")
+    key_id = config.RAZORPAY_KEY_ID
+    key_secret = config.RAZORPAY_KEY_SECRET
     if not key_id or not key_secret:
         raise RuntimeError(
             "RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET are not set. Get test-mode "

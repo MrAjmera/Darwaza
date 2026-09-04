@@ -511,6 +511,67 @@ code and a printed message for the CLI, an HTTP status code and a JSON
 body for the API — without service.py knowing or caring which one is
 asking.
 
+## 14. Credentials are loaded and validated at import time, not read
+    from `os.environ` per call — and a live Razorpay key refuses to
+    even start the process
+
+**Chosen:** `config.py` reads every credential and configurable path
+from `os.environ` exactly once, at module import time, and immediately
+validates `RAZORPAY_KEY_ID` if one is configured: if it doesn't start
+with `rzp_test_`, `config.py` raises `ConfigError` and the import
+fails — nothing else in the package can run. Every other module reads
+its configuration via `from darwaza import config` then `config.X`
+(attribute access on the live module), never `from darwaza.config
+import X` (which would copy the value once and stop tracking updates)
+and never `os.environ` directly.
+
+**Rejected:** Leaving credential reads where they were (inside
+`razorpay_client.create_order()` and `llm_explainer.explain()`,
+per-call, as before Stage 5) and only adding the `rzp_test_` format
+check as an assertion inside `create_order()` itself.
+
+**Why validating at import time instead of at the point of use is the
+actual point, not a style preference:** the dangerous case is a human
+approving a NEEDS_HUMAN request that consumes most of a mandate's
+cap — precisely the moment this project's whole thesis says deserves
+the most scrutiny — and *that* being the first time a live-key
+misconfiguration is discovered, with a real charge potentially already
+in flight. Validating at process start means a misconfigured deployment
+never serves a single request; the failure happens at the most boring,
+consequence-free possible moment (an import), not the highest-stakes
+one.
+
+**Why `config.X` attribute access instead of importing the names
+directly:** this is what keeps every module's configuration testable
+without needing a fresh subprocess per test. `monkeypatch.setattr(config,
+"RAZORPAY_KEY_ID", None)` mutates the actual `config` module namespace;
+any code doing `config.RAZORPAY_KEY_ID` *at the moment it needs the
+value* sees the patched value, exactly as if the environment had really
+changed. A name bound once via `from darwaza.config import
+RAZORPAY_KEY_ID` would freeze that value into the importing module's
+own namespace at import time, and no later monkeypatch of `config`
+would reach it — this is not a hypothetical: it's exactly what broke
+`tests/test_razorpay_client.py`'s `monkeypatch.delenv(...)` calls when
+this stage moved credential reads to `config.py` (fixed by switching
+those tests to `monkeypatch.setattr(config, ...)` instead — see that
+test file's docstring).
+
+**A real, deliberate side effect: importing `darwaza.config` with a
+live key set now crashes the whole process, including running the test
+suite.** This is treated as correct, not as friction to design around —
+if a developer's shell happens to have a real Razorpay key exported
+while running `pytest` or `python -m darwaza.cli`, refusing to start at
+all is exactly the outcome wanted. Nothing in this codebase should ever
+run against real payment credentials, on purpose or by accident.
+
+**What's still explicitly not validated, and why that's fine:**
+`RAZORPAY_KEY_SECRET` and `ANTHROPIC_API_KEY` have no format Razorpay
+or Anthropic exposes to check against — unlike `RAZORPAY_KEY_ID`,
+there's no `test_`/`live_` prefix convention for a secret or an API
+key, so there's nothing safe to assert about their shape beyond
+"configured or not." Both remain genuinely optional, exactly as before
+this stage — this project runs end-to-end with neither set.
+
 ## Open items
 
 - **Multi-instance replay protection isn't solved** — this is

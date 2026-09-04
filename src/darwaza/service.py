@@ -17,30 +17,23 @@ go through" for the HTTP surface to drift from.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-from darwaza import llm_explainer, razorpay_client
+from darwaza import config, llm_explainer, razorpay_client
 from darwaza.approval_queue import ApprovalQueue
 from darwaza.audit_log import append_entry
 from darwaza.nonce_store import NonceStore
 from darwaza.policy_engine import evaluate
 from darwaza.schema import Decision, NormalizedMandate, Outcome, ProposedTransaction
 
-# State file locations. Default to the repo root (stable regardless of
-# the caller's cwd — this is a real gateway's persistent state, not
-# scratch output, so it shouldn't move around based on where you happen
-# to invoke a command, or where a server process happens to be started,
-# from). Overridable via env vars so tests (and a user who wants a
-# clean, isolated demo run) can point them elsewhere without touching
-# the real repo-root files. Moved here from cli.py (Stage 4) so api.py
-# shares the exact same defaults instead of redefining them.
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_LOG_PATH = Path(os.environ.get("DARWAZA_AUDIT_LOG_PATH", str(REPO_ROOT / "audit_log.jsonl")))
-DEFAULT_NONCE_DB_PATH = Path(os.environ.get("DARWAZA_NONCE_DB_PATH", str(REPO_ROOT / "nonces.db")))
-DEFAULT_APPROVAL_DB_PATH = Path(
-    os.environ.get("DARWAZA_APPROVAL_DB_PATH", str(REPO_ROOT / "approvals.db"))
-)
+# State file paths now live in config.py (Stage 5) — every module reads
+# its configuration from there, not from os.environ directly. Kept as
+# re-exports here (rather than deleted) since cli.py and api.py already
+# reference service.DEFAULT_* and there's no reason to force a second
+# rename on top of the one this stage already requires elsewhere.
+DEFAULT_LOG_PATH = config.AUDIT_LOG_PATH
+DEFAULT_NONCE_DB_PATH = config.NONCE_DB_PATH
+DEFAULT_APPROVAL_DB_PATH = config.APPROVAL_DB_PATH
 
 
 class AuthorizationResult:

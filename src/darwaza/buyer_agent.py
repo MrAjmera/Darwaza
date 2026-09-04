@@ -33,8 +33,7 @@ module's.
 
 from __future__ import annotations
 
-import os
-
+from darwaza import config
 from darwaza.catalog import INJECTION_MARKER, find_by_category
 from darwaza.schema import ProposedTransaction
 
@@ -71,7 +70,7 @@ def decide_with_llm(shopping_goal: str, category: str) -> ProposedTransaction:
     for the user to run live rather than committed as a passing test
     (a live model call isn't reproducible enough to assert on).
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = config.ANTHROPIC_API_KEY
     if not api_key:
         raise RuntimeError(
             "decide_with_llm() requires ANTHROPIC_API_KEY. Use "

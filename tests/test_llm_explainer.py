@@ -4,6 +4,11 @@ No ANTHROPIC_API_KEY is set in the test environment, so these exercise
 the fallback path — which is deliberate: a live model call isn't
 reproducible enough to assert on, and the fallback path is exactly what
 this build actually runs without a configured key.
+
+As of Stage 5, explain() reads ANTHROPIC_API_KEY from config.py (resolved
+once at import time), not os.environ directly per call --
+`monkeypatch.setattr(config, "ANTHROPIC_API_KEY", None)` is what actually
+reaches it now; see test_razorpay_client.py for the same pattern and why.
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from darwaza import llm_explainer
+from darwaza import config, llm_explainer
 from darwaza.schema import Decision, NormalizedMandate, Outcome, ProposedTransaction
 
 FUTURE = datetime.now(timezone.utc) + timedelta(days=1)
@@ -43,7 +48,7 @@ def test_raises_for_deny_decision():
 
 
 def test_fallback_explanation_for_needs_human(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", None)
     decision = Decision(
         outcome=Outcome.NEEDS_HUMAN,
         reason="Transaction amount 800.0 is 80% of mandate cap 1000.0 — above threshold.",
