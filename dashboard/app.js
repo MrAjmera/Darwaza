@@ -77,29 +77,50 @@
   // ---------------------------------------------------------------
   // Overview + top bar counters
   // ---------------------------------------------------------------
+  // Two genuinely different numbers, both real -- see
+  // DECISIONS.md #15. /metrics' `counters` is in-process memory: it
+  // resets to zero on every restart, which looks like data loss if
+  // it's the headline number and the server gets restarted mid-demo.
+  // The audit log is the durable, cumulative one -- everything this
+  // gate has ever decided, across every restart -- so it's what the
+  // header and the big tiles show. The in-process count is still
+  // surfaced, just clearly labeled as "since this server started"
+  // rather than presented as the total.
+  function tallyOutcomes(entries) {
+    const tally = { ALLOW: 0, DENY: 0, NEEDS_HUMAN: 0 };
+    entries.forEach((e) => { if (tally[e.outcome] !== undefined) tally[e.outcome]++; });
+    return tally;
+  }
+
   async function refreshOverview() {
     try {
-      const [metricsRes, auditRes] = await Promise.all([api('/metrics'), api('/v1/audit-log?limit=1')]);
+      const [metricsRes, auditRes] = await Promise.all([api('/metrics'), api('/v1/audit-log?limit=500')]);
       setConnection(true);
       const metrics = await metricsRes.json();
       const audit = await auditRes.json();
-      const byOutcome = metrics.counters.by_outcome || {};
+      const allTime = tallyOutcomes(audit.entries);
+      const sessionByOutcome = metrics.counters.by_outcome || {};
 
-      $('#tc-allow').textContent = byOutcome.ALLOW ?? 0;
-      $('#tc-deny').textContent = byOutcome.DENY ?? 0;
-      $('#tc-human').textContent = byOutcome.NEEDS_HUMAN ?? 0;
-      $('#ov-allow').textContent = byOutcome.ALLOW ?? 0;
-      $('#ov-deny').textContent = byOutcome.DENY ?? 0;
-      $('#ov-human').textContent = byOutcome.NEEDS_HUMAN ?? 0;
-      $('#ov-entries').textContent = metrics.audit_log.entries ?? 0;
+      $('#tc-allow').textContent = allTime.ALLOW;
+      $('#tc-deny').textContent = allTime.DENY;
+      $('#tc-human').textContent = allTime.NEEDS_HUMAN;
+      $('#ov-allow').textContent = allTime.ALLOW;
+      $('#ov-deny').textContent = allTime.DENY;
+      $('#ov-human').textContent = allTime.NEEDS_HUMAN;
+      $('#ov-entries').textContent = audit.total_entries;
 
-      const chainOk = metrics.audit_log.chain_intact;
+      $('#ov-session-line').textContent =
+        'Since this server process last started: ' + (sessionByOutcome.ALLOW ?? 0) + ' ALLOW, ' +
+        (sessionByOutcome.DENY ?? 0) + ' DENY, ' + (sessionByOutcome.NEEDS_HUMAN ?? 0) +
+        ' NEEDS_HUMAN (in-process only -- resets on restart, see /metrics).';
+
+      const chainOk = audit.chain_intact;
       const chainPill = $('#ov-chain-pill');
       chainPill.textContent = chainOk ? 'chain intact' : 'chain BROKEN';
       chainPill.className = 'pill ' + (chainOk ? 'allow' : 'deny');
       $('#ov-chain-detail').textContent = chainOk
-        ? metrics.audit_log.entries + ' entries verified, none tampered.'
-        : (metrics.audit_log.chain_break_reason || 'see Audit Trail tab');
+        ? audit.total_entries + ' entries verified, none tampered.'
+        : (audit.chain_break_reason || 'see Audit Trail tab');
     } catch (e) {
       setConnection(false);
     }

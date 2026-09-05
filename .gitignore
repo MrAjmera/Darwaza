@@ -6,5 +6,6 @@ __pycache__/
 audit_log.jsonl
 nonces.db
 approvals.db
+audit_log.jsonl.lock
 .env
 _to_delete/

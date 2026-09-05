@@ -52,14 +52,15 @@
     <div class="hero-line"><b>Darwaza</b> /dər-vaː-zaː/ — Hindi for <b>door</b>. Three outcomes only: ALLOW, DENY, NEEDS_HUMAN. Zero LLM calls anywhere in that decision.</div>
 
     <div class="statgrid">
-      <div class="stat allow"><div class="n" id="ov-allow">—</div><div class="l">ALLOW decisions</div></div>
-      <div class="stat deny"><div class="n" id="ov-deny">—</div><div class="l">DENY decisions</div></div>
-      <div class="stat human"><div class="n" id="ov-human">—</div><div class="l">routed to a human</div></div>
+      <div class="stat allow"><div class="n" id="ov-allow">—</div><div class="l">ALLOW, all-time</div></div>
+      <div class="stat deny"><div class="n" id="ov-deny">—</div><div class="l">DENY, all-time</div></div>
+      <div class="stat human"><div class="n" id="ov-human">—</div><div class="l">routed to a human, all-time</div></div>
       <div class="stat"><div class="n" id="ov-entries">—</div><div class="l">audit log entries</div></div>
     </div>
+    <p id="ov-session-line" style="font-size:12px; color:var(--ink-faint); font-family:var(--font-mono); margin-top:10px;">—</p>
 
     <h3>Chain integrity</h3>
-    <p class="section-lead">Every decision below is hash-chained to the one before it. This reads the exact same <code>verify_chain()</code> result <code>/metrics</code> reports — see the Audit Trail tab to inspect the chain itself.</p>
+    <p class="section-lead">Every decision below is hash-chained to the one before it. This reads the exact same <code>verify_chain()</code> result the Audit Trail tab uses — see that tab to inspect the chain itself.</p>
     <div class="card" style="display:flex; align-items:center; gap:14px;">
       <span class="pill" id="ov-chain-pill">checking…</span>
       <span style="font-size:13px; color:var(--ink-faint);" id="ov-chain-detail">—</span>
