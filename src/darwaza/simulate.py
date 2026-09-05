@@ -65,11 +65,22 @@ def _run(
 
 
 def scenario_happy_path(
-    *, log_path: Path, nonce_db_path: Path, approval_db_path: Path
+    *,
+    log_path: Path,
+    nonce_db_path: Path,
+    approval_db_path: Path,
+    mandate_id: str = "sim-happy-1",
 ) -> AuthorizationResult:
     """A legitimate buyer agent, buying something ordinary and in-budget.
-    Expected: ALLOW."""
-    mandate = _signed_mandate("sim-happy-1")
+    Expected: ALLOW.
+
+    `mandate_id` defaults to the fixed id every CLI run has always used
+    (tests/docs reference it) -- api.py's POST /v1/demo/simulate/...
+    endpoint overrides it with a fresh id per call, so a dashboard
+    button can be clicked more than once without the second click
+    hitting `replay` against the first click's already-claimed nonce.
+    """
+    mandate = _signed_mandate(mandate_id)
     proposed_tx = buyer_agent.decide_deterministic("books")
     return _run(
         mandate, proposed_tx, log_path=log_path, nonce_db_path=nonce_db_path, approval_db_path=approval_db_path
@@ -77,14 +88,21 @@ def scenario_happy_path(
 
 
 def scenario_poisoned_catalog(
-    *, log_path: Path, nonce_db_path: Path, approval_db_path: Path
+    *,
+    log_path: Path,
+    nonce_db_path: Path,
+    approval_db_path: Path,
+    mandate_id: str = "sim-poisoned-1",
 ) -> AuthorizationResult:
     """A buyer agent that (as an unguarded LLM-based agent would) obeys
     an instruction embedded in a product description, inflating the
     transaction to 999,999. Expected: DENY on amount_cap — the mandate's
     real ceiling is enforced regardless of what the compromised agent
-    proposed."""
-    mandate = _signed_mandate("sim-poisoned-1")
+    proposed.
+
+    See scenario_happy_path() for why `mandate_id` is overridable.
+    """
+    mandate = _signed_mandate(mandate_id)
     proposed_tx = buyer_agent.decide_deterministic(
         "electronics", obey_injected_instructions=True
     )
@@ -94,15 +112,21 @@ def scenario_poisoned_catalog(
 
 
 def scenario_large_purchase_needs_human(
-    *, log_path: Path, nonce_db_path: Path, approval_db_path: Path
+    *,
+    log_path: Path,
+    nonce_db_path: Path,
+    approval_db_path: Path,
+    mandate_id: str = "sim-needs-human-1",
 ) -> AuthorizationResult:
     """A legitimate (non-attack) purchase that happens to consume most of
     the mandate's cap in one request — the NEEDS_HUMAN path, not an
     attack. Amount is picked directly (not via buyer_agent) because this
     scenario is about the threshold rule in policy_engine.py, not about
     catalog manipulation. Expected: NEEDS_HUMAN, failed_check
-    "human_review_threshold"."""
-    mandate = _signed_mandate("sim-needs-human-1")
+    "human_review_threshold". See scenario_happy_path() for why
+    `mandate_id` is overridable.
+    """
+    mandate = _signed_mandate(mandate_id)
     proposed_tx = ProposedTransaction(
         merchant_id="merchant-bestbuy", amount=650.0, category="electronics"
     )

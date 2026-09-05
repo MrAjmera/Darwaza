@@ -31,17 +31,21 @@ Run it with:
 
 from __future__ import annotations
 
+import json
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from darwaza import observability, rate_limit, service
 from darwaza.audit_log import verify_chain
 from darwaza.schema import NormalizedMandate, Outcome, ProposedTransaction
+from darwaza.simulate import SCENARIOS
 
 app = FastAPI(
     title="Darwaza",
@@ -51,6 +55,20 @@ app = FastAPI(
         "check and status code below."
     ),
 )
+
+# The dashboard is a static, self-contained frontend (dashboard/ at the
+# repo root, alongside src/ and tests/) that presents Darwaza's
+# architecture and demos it live against the two thin read/demo
+# endpoints below. It is deliberately NOT part of the trust boundary --
+# see docs/HLD.md's "outside" row, same category as buyer_agent.py and
+# catalog.py. Mounting it here means `uvicorn darwaza.api:app` is still
+# the only command needed to run the whole demo (README's one-command
+# quickstart is unchanged); removing the dashboard entirely is deleting
+# the dashboard/ folder, this mount, and the two endpoints below -- no
+# other file in this project references any of the three.
+_DASHBOARD_DIR = Path(__file__).resolve().parent.parent.parent / "dashboard"
+if _DASHBOARD_DIR.is_dir():
+    app.mount("/dashboard", StaticFiles(directory=str(_DASHBOARD_DIR), html=True), name="dashboard")
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +316,103 @@ def execute_request(
             "razorpay_error": result.razorpay_error,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/audit-log, POST /v1/demo/simulate/{scenario}
+#
+# Both exist for the dashboard's benefit and nowhere else. Neither adds
+# a write path, a policy check, or a new way to reach evaluate() --
+# they're read/demo-only views over exactly what /v1/authorize and
+# /metrics already produce. See docs/HLD.md: these two, like
+# buyer_agent.py/simulate.py/catalog.py, sit outside the trust
+# boundary -- deleting this whole section changes nothing about what
+# the enforcement path does or how it's tested.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/v1/audit-log")
+def get_audit_log(limit: int = 50, log_path: Path = Depends(_log_path)) -> dict:
+    """Read-only view over the same audit_log.jsonl every decision
+    already writes to via audit_log.append_entry() -- no second store,
+    no new write path. Returns the most recent `limit` entries (newest
+    first, capped at 500) plus the same chain_intact / chain_break_reason
+    /metrics already reports, computed the same way (verify_chain()),
+    so the dashboard never has a second, possibly-disagreeing opinion
+    about whether the chain is intact.
+    """
+    entries: list[dict] = []
+    if log_path.exists():
+        with log_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entries.append(json.loads(line))
+
+    chain_ok, chain_break_reason = verify_chain(log_path)
+    capped_limit = max(1, min(limit, 500))
+
+    return {
+        "total_entries": len(entries),
+        "chain_intact": chain_ok,
+        "chain_break_reason": chain_break_reason,
+        "entries": list(reversed(entries[-capped_limit:])),
+    }
+
+
+@app.post("/v1/demo/simulate/{scenario}")
+def demo_simulate(
+    scenario: str,
+    log_path: Path = Depends(_log_path),
+    nonce_db_path: Path = Depends(_nonce_db_path),
+    approval_db_path: Path = Depends(_approval_db_path),
+) -> JSONResponse:
+    """Thin wrapper around simulate.py's existing scenario runner -- the
+    exact same buyer_agent -> service.authorize() path `cli.py simulate`
+    already calls (see simulate.py's module docstring). This handler
+    builds nothing and decides nothing; it only looks up which
+    pre-built scenario to run and shapes its AuthorizationResult as
+    JSON, the same way authorize() above shapes a real POST
+    /v1/authorize call via _decision_body().
+
+    Each call generates a fresh mandate_id (simulate.py's scenario
+    functions default to a fixed id, meant for one CLI run at a time --
+    see their docstrings) so clicking the same dashboard button twice
+    in a row demonstrates the scenario twice, rather than the second
+    click hitting `replay` against the first click's already-claimed
+    nonce.
+    """
+    runner = SCENARIOS.get(scenario)
+    if runner is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "unknown_scenario",
+                "detail": f"{scenario!r} is not a known demo scenario.",
+                "known_scenarios": sorted(SCENARIOS),
+            },
+        )
+
+    unique_mandate_id = f"demo-{scenario}-{uuid.uuid4().hex[:10]}"
+    result = runner(
+        log_path=log_path,
+        nonce_db_path=nonce_db_path,
+        approval_db_path=approval_db_path,
+        mandate_id=unique_mandate_id,
+    )
+
+    body = _decision_body(result)
+    body["scenario"] = scenario
+    body["principal_id"] = result.mandate.principal_id
+    body["agent_id"] = result.mandate.agent_id
+    body["proposed_tx"] = result.proposed_tx.model_dump(mode="json")
+
+    status_code = {
+        Outcome.ALLOW: 200,
+        Outcome.DENY: 403,
+        Outcome.NEEDS_HUMAN: 202,
+    }[result.decision.outcome]
+    return JSONResponse(status_code=status_code, content=body)
 
 
 # ---------------------------------------------------------------------------

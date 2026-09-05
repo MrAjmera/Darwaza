@@ -121,6 +121,7 @@ docstrings ("deliberately NOT part of Darwaza's trust boundary").
 | `llm_explainer.py` | Downstream-only NEEDS_HUMAN explanation (cannot change the decision) | boundary output |
 | `razorpay_client.py` | Test-mode order creation after a human/system decision | boundary output |
 | `buyer_agent.py`, `simulate.py`, `catalog.py` | Attack demonstration / simulated agent — plays the untrusted side on purpose | outside |
+| `dashboard/` + `GET /v1/audit-log`, `POST /v1/demo/simulate/{scenario}` | A static (no build step) read/demo frontend, plus the two thin API endpoints it consumes. Presents the architecture and runs the same `simulate.py` scenarios and `/v1/authorize` path everything above already exercises — no new write path, no new way to reach `evaluate()`. Mounted onto the same FastAPI app (`/dashboard`) so `uvicorn darwaza.api:app` is still the only command needed. Removable entirely: delete `dashboard/`, the mount in `api.py`, and the two endpoints — nothing else in this project references any of the three. | outside |
 
 ## Deployment shape
 

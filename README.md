@@ -129,6 +129,34 @@ Every run appends to `audit_log.jsonl` in the repo root (gitignored —
 it's runtime state, not source). `nonces.db` and `approvals.db` are the
 same: gitignored, persistent, safe to delete to reset the demo.
 
+## Dashboard
+
+A static (no build step, no framework) frontend at `dashboard/`,
+mounted onto the same FastAPI app so it's already running the moment
+`uvicorn darwaza.api:app --reload` is:
+
+```
+uvicorn darwaza.api:app --reload
+```
+
+Then open **http://127.0.0.1:8000/dashboard/**. Eight tabs: a live
+overview (the same counters and chain-intact status `/metrics`
+reports), a Live Demo tab that triggers the three `simulate.py`
+scenarios and shows the decision that comes back, an Approvals tab
+that turns `review`/`approve`/`deny`/`execute` into buttons, a full
+Audit Trail view of the hash chain, and Architecture/Design/
+Scaling/Limitations tabs carrying the HLD, LLD, and the honest gaps as
+one page instead of five separate markdown files.
+
+It exists entirely outside the trust boundary — see
+[docs/HLD.md](docs/HLD.md)'s component table. It's a view over data
+`/v1/authorize` and `cli.py` already produce, plus two thin additions
+(`GET /v1/audit-log`, `POST /v1/demo/simulate/{scenario}`) that wrap
+existing read/demo code and add no new way to reach `evaluate()`. It's
+also fully removable: delete `dashboard/`, the static mount and the
+two endpoints in `api.py`, and nothing else in this repo references
+any of the three.
+
 ## API quickstart
 
 ```

@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Darwaza — Live Console</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">
+    <div class="mark"><svg viewBox="0 0 24 24" fill="none"><path d="M5 21V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v15" stroke="white" stroke-width="1.8"/><path d="M9 21v-7h6v7" stroke="white" stroke-width="1.8"/><circle cx="14.5" cy="12" r="0.9" fill="white"/></svg></div>
+    <div>
+      <div class="word">Darwaza</div>
+      <div class="sub">live console</div>
+    </div>
+  </div>
+  <div class="conn" id="conn-status"><span class="dot"></span><span id="conn-text">connecting…</span></div>
+  <div class="topcounters" id="top-counters">
+    <span class="tc allow">ALLOW <b id="tc-allow">—</b></span>
+    <span class="tc deny">DENY <b id="tc-deny">—</b></span>
+    <span class="tc human">NEEDS_HUMAN <b id="tc-human">—</b></span>
+  </div>
+</div>
+
+<nav class="tabbar" id="tabbar">
+  <button class="tabbtn active" data-tab="overview"><span class="n">01</span>Overview</button>
+  <button class="tabbtn" data-tab="demo"><span class="n">02</span>Live Demo</button>
+  <button class="tabbtn" data-tab="approvals"><span class="n">03</span>Approvals</button>
+  <button class="tabbtn" data-tab="audit"><span class="n">04</span>Audit Trail</button>
+  <button class="tabbtn" data-tab="hld"><span class="n">05</span>Architecture</button>
+  <button class="tabbtn" data-tab="lld"><span class="n">06</span>Design</button>
+  <button class="tabbtn" data-tab="scaling"><span class="n">07</span>Scaling &amp; Alternatives</button>
+  <button class="tabbtn" data-tab="limitations"><span class="n">08</span>Limitations</button>
+</nav>
+
+<main>
+  <div class="banner" id="offline-banner" style="display:none;">
+    <span>⚠</span>
+    <span>Can't reach the Darwaza API. Start it with <code>uvicorn darwaza.api:app --reload</code> from the repo root, then reload this page.</span>
+  </div>
+
+  <!-- ============ 01 OVERVIEW ============ -->
+  <section class="panel active" id="panel-overview">
+    <span class="eyebrow">Razorpay AI Buildathon · Track 01</span>
+    <div class="thesis-block">
+      <h1>An authorization gate for AI buying agents — watched live.</h1>
+      <p>Darwaza decides, in code, whether an AI agent is allowed to spend a merchant's money — before Razorpay ever sees the request. This console is a read/demo layer sitting outside that decision path: everything below either displays what the gate already recorded, or triggers the exact same scenarios the CLI's <code>simulate</code> command runs.</p>
+    </div>
+    <div class="hero-line"><b>Darwaza</b> /dər-vaː-zaː/ — Hindi for <b>door</b>. Three outcomes only: ALLOW, DENY, NEEDS_HUMAN. Zero LLM calls anywhere in that decision.</div>
+
+    <div class="statgrid">
+      <div class="stat allow"><div class="n" id="ov-allow">—</div><div class="l">ALLOW decisions</div></div>
+      <div class="stat deny"><div class="n" id="ov-deny">—</div><div class="l">DENY decisions</div></div>
+      <div class="stat human"><div class="n" id="ov-human">—</div><div class="l">routed to a human</div></div>
+      <div class="stat"><div class="n" id="ov-entries">—</div><div class="l">audit log entries</div></div>
+    </div>
+
+    <h3>Chain integrity</h3>
+    <p class="section-lead">Every decision below is hash-chained to the one before it. This reads the exact same <code>verify_chain()</code> result <code>/metrics</code> reports — see the Audit Trail tab to inspect the chain itself.</p>
+    <div class="card" style="display:flex; align-items:center; gap:14px;">
+      <span class="pill" id="ov-chain-pill">checking…</span>
+      <span style="font-size:13px; color:var(--ink-faint);" id="ov-chain-detail">—</span>
+    </div>
+
+    <h3>Where to go next</h3>
+    <div class="grid3">
+      <div class="card"><h4 style="font-size:14px; margin-bottom:6px;">Watch it decide</h4><p style="font-size:13px; margin:0;">Run a live scenario — an ordinary purchase, a poisoned catalog attack, or a request big enough to need a human — in the <b>Live Demo</b> tab.</p></div>
+      <div class="card"><h4 style="font-size:14px; margin-bottom:6px;">Resolve a flag</h4><p style="font-size:13px; margin:0;">Anything routed to a human waits in the <b>Approvals</b> tab — approve, deny, or retry execution against Razorpay.</p></div>
+      <div class="card"><h4 style="font-size:14px; margin-bottom:6px;">Read the reasoning</h4><p style="font-size:13px; margin:0;">Architecture, Design, Scaling and Limitations tabs carry the full HLD/LLD, the alternatives weighed, and the honest gaps.</p></div>
+    </div>
+  </section>
+
+  <!-- ============ 02 LIVE DEMO ============ -->
+  <section class="panel" id="panel-demo">
+    <h2 style="font-size:24px; margin-bottom:6px;">Live demo</h2>
+    <p class="section-lead">Each button calls <code>POST /v1/demo/simulate/&#123;scenario&#125;</code> — a thin wrapper around the same <code>buyer_agent → service.authorize()</code> path the CLI's <code>simulate</code> command runs. No enforcement logic lives here; this tab only triggers it and shows you what came back.</p>
+
+    <div class="grid3">
+      <div class="card scenario-card">
+        <span class="pill allow">expect ALLOW</span>
+        <h4>Happy path</h4>
+        <p>A legitimate buyer agent buys an in-budget book. Nothing unusual — the baseline the attacks below are compared against.</p>
+        <button class="btn primary" data-scenario="happy-path">Run happy-path</button>
+      </div>
+      <div class="card scenario-card">
+        <span class="pill deny">expect DENY</span>
+        <h4>Poisoned catalog</h4>
+        <p>A product listing carries a hidden instruction telling the buyer agent to inflate the order to ₹999,999. The mandate's real cap is enforced regardless.</p>
+        <button class="btn primary" data-scenario="poisoned-catalog">Run poisoned-catalog</button>
+      </div>
+      <div class="card scenario-card">
+        <span class="pill human">expect NEEDS_HUMAN</span>
+        <h4>Large legitimate purchase</h4>
+        <p>Not an attack — a real request that happens to use most of the mandate's cap in one shot, so it's routed to a human instead of auto-approved.</p>
+        <button class="btn primary" data-scenario="needs-human">Run needs-human</button>
+      </div>
+    </div>
+
+    <h3>Results this session</h3>
+    <div id="demo-results"><div class="empty">No scenarios run yet — click a button above.</div></div>
+  </section>
+
+  <!-- ============ 03 APPROVALS ============ -->
+  <section class="panel" id="panel-approvals">
+    <h2 style="font-size:24px; margin-bottom:6px;">Human approval queue</h2>
+    <p class="section-lead">A human resolving a flagged request is a judgment call at a terminal — the CLI's <code>review</code>/<code>approve</code>/<code>deny</code>/<code>execute</code> commands do exactly this. This tab is the same decision, as a click instead of a command, hitting the same <code>service.py</code> functions.</p>
+
+    <h3>Waiting on a decision</h3>
+    <div id="approvals-pending"><div class="empty">Loading…</div></div>
+
+    <h3>Approved, not yet executed against Razorpay</h3>
+    <p class="section-lead">A human said yes; the Razorpay order hasn't been created yet (no keys configured, or a transient failure). Retryable, any number of times, without repeating the human decision.</p>
+    <div id="approvals-pending-execution"><div class="empty">Loading…</div></div>
+  </section>
+
+  <!-- ============ 04 AUDIT TRAIL ============ -->
+  <section class="panel" id="panel-audit">
+    <h2 style="font-size:24px; margin-bottom:6px;">Audit trail</h2>
+    <p class="section-lead">Every entry hashes in the previous entry's hash (<code>prev_hash</code>) — tampering any past entry breaks every hash after it. <code>chain_intact</code> below is computed by walking the whole file, the same <code>verify_chain()</code> call <code>/metrics</code> uses.</p>
+    <div class="card" style="display:flex; align-items:center; gap:14px; margin-bottom:18px;">
+      <span class="pill" id="audit-chain-pill">checking…</span>
+      <span style="font-size:13px; color:var(--ink-faint);" id="audit-chain-detail">—</span>
+      <button class="btn small" style="margin-left:auto;" id="audit-refresh">Refresh</button>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>seq</th><th>outcome</th><th>mandate_id</th><th>failed_check</th><th>timestamp</th><th>prev_hash</th></tr></thead>
+        <tbody id="audit-rows"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ 05 ARCHITECTURE (HLD) ============ -->
+  <section class="panel" id="panel-hld">
+    <h2 style="font-size:24px; margin-bottom:6px;">High-level design</h2>
+    <p class="section-lead">The trust boundary the rest of the system hangs off: everything on the agent's side is untrusted input, including the agent itself. Nothing crosses it as "trusted" until it passes a named check.</p>
+
+    <pre class="mermaid">
+flowchart TB
+    subgraph untrusted["UNTRUSTED — agent's side of the gate"]
+        Catalog["Merchant catalog\n(attacker-controlled listing text)"]
+        Agent["Buying agent\n(simulated here, or any real\nAP2 / ACP-speaking agent)"]
+        Mandate["Mandate + proposed transaction"]
+        Catalog -->|agent reads listings| Agent
+        Agent -->|constructs| Mandate
+    end
+    subgraph gate["DARWAZA — trusted"]
+        API["api.py\nPOST /v1/authorize"]
+        CLI["cli.py\ndecide / simulate"]
+        RateLimit["rate_limit.py\ntoken bucket, API only"]
+        Service["service.py\nauthorize() / resolve_approval()"]
+        Keys["keys.py\nper-principal signatures"]
+        Engine["policy_engine.py\nevaluate() — zero LLM calls"]
+        Nonce["nonce_store.py\nSQLite, atomic claim()"]
+        Audit["audit_log.py\nhash-chained JSONL"]
+        Explainer["llm_explainer.py\ndownstream only"]
+        Queue["approval_queue.py\nSQLite pending queue"]
+        Razorpay["razorpay_client.py\ntest-mode, retry + idempotent"]
+        API --> RateLimit --> Service
+        CLI --> Service
+        Service --> Engine
+        Engine --> Keys
+        Engine --> Nonce
+        Service --> Audit
+        Service -->|NEEDS_HUMAN| Explainer
+        Service -->|NEEDS_HUMAN| Queue
+        Queue -->|human approves| Razorpay
+    end
+    Mandate -->|"crosses the trust\nboundary here"| gate
+    Human["Human reviewer\n(CLI or Approvals tab)"] <--> CLI
+    Engine -->|ALLOW| O1["200 OK"]
+    Engine -->|DENY| O2["403"]
+    Engine -->|NEEDS_HUMAN| O3["202 Accepted"]
+    O1 --> Audit
+    O2 --> Audit
+    O3 --> Audit
+    </pre>
+
+    <h3>Component responsibilities</h3>
+    <div class="tablewrap"><table>
+      <tr><th>Component</th><th>Responsibility</th><th>Boundary</th></tr>
+      <tr><td><code>schema.py</code></td><td>Normalizes AP2/ACP into one <code>NormalizedMandate</code> shape</td><td>inside</td></tr>
+      <tr><td><code>keys.py</code></td><td>Per-principal Ed25519 keypairs — sign / verify</td><td>inside</td></tr>
+      <tr><td><code>policy_engine.py</code></td><td>The only place ALLOW / DENY / NEEDS_HUMAN is decided</td><td>inside</td></tr>
+      <tr><td><code>nonce_store.py</code></td><td>Persistent, atomic replay protection</td><td>inside</td></tr>
+      <tr><td><code>audit_log.py</code></td><td>Hash-chained, append-only decision record</td><td>inside</td></tr>
+      <tr><td><code>approval_queue.py</code></td><td>NEEDS_HUMAN queue; approved → executed lifecycle</td><td>inside</td></tr>
+      <tr><td><code>service.py</code></td><td>One enforcement path both entry points call</td><td>inside</td></tr>
+      <tr><td><code>api.py</code> / <code>cli.py</code></td><td>HTTP surface for agents / terminal surface for humans</td><td>inside</td></tr>
+      <tr><td><code>llm_explainer.py</code></td><td>Plain-language NEEDS_HUMAN explanation — cannot change the decision</td><td>boundary output</td></tr>
+      <tr><td><code>razorpay_client.py</code></td><td>Test-mode order creation after a decision is already final</td><td>boundary output</td></tr>
+      <tr><td><code>buyer_agent.py</code>, <code>catalog.py</code></td><td>Plays the attacker — demonstrates attacks on purpose</td><td>outside</td></tr>
+      <tr><td><code>dashboard/</code> (this console)</td><td>Read/demo view over the above — 2 thin endpoints, no new enforcement</td><td>outside</td></tr>
+    </table></div>
+  </section>
+
+  <!-- ============ 06 DESIGN (LLD) ============ -->
+  <section class="panel" id="panel-lld">
+    <h2 style="font-size:24px; margin-bottom:6px;">Low-level design</h2>
+    <p class="section-lead">The check order inside <code>evaluate()</code> is a correctness property, not a style choice — see the two rows below marked "why it's last."</p>
+
+    <div class="tablewrap"><table>
+      <tr><th>#</th><th>Check</th><th>failed_check</th></tr>
+      <tr><td>0</td><td>Amount is finite and &gt; 0</td><td><code>invalid_amount</code></td></tr>
+      <tr><td>a0</td><td>Principal is registered at all</td><td><code>unknown_principal</code></td></tr>
+      <tr><td>a</td><td>Signature verifies against that principal's key</td><td><code>signature</code></td></tr>
+      <tr><td>b</td><td>Mandate not expired</td><td><code>expiry</code></td></tr>
+      <tr><td>c</td><td>ACP: bound merchant matches</td><td><code>merchant_match</code></td></tr>
+      <tr><td>d</td><td>Amount within cap / exact match</td><td><code>amount_cap</code></td></tr>
+      <tr><td>e</td><td>AP2: category in scope</td><td><code>category_scope</code></td></tr>
+      <tr><td>f</td><td>AP2: &gt;50% of cap → route to a human</td><td><code>human_review_threshold</code> → <span class="pill human">NEEDS_HUMAN</span></td></tr>
+      <tr><td>g</td><td>Replay claim — atomic, always last (why: a mandate destined to fail on amount/category shouldn't burn its nonce on the way out — that would be a DoS primitive against the real principal's one legitimate use)</td><td><code>replay</code></td></tr>
+    </table></div>
+
+    <h3>Sequence: the happy path</h3>
+    <pre class="mermaid">
+sequenceDiagram
+    participant Agent as Buying agent
+    participant API as api.py
+    participant Svc as service.authorize()
+    participant Eng as policy_engine.evaluate()
+    participant Nonce as nonce_store
+    participant Audit as audit_log
+    Agent->>API: POST /v1/authorize
+    API->>Svc: authorize(mandate, tx)
+    Svc->>Eng: evaluate()
+    Eng->>Eng: checks 0, a0, a, b, c, d, e, f pass
+    Eng->>Nonce: claim(mandate_id) -- last
+    Nonce-->>Eng: true
+    Eng-->>Svc: ALLOW
+    Svc->>Audit: append_entry(ALLOW)
+    Svc-->>API: 200
+    API-->>Agent: outcome ALLOW
+    </pre>
+
+    <h3>Sequence: NEEDS_HUMAN → approve → execute</h3>
+    <pre class="mermaid">
+sequenceDiagram
+    participant Agent as Buying agent
+    participant API as api.py
+    participant Svc as service.py
+    participant Explain as llm_explainer
+    participant Queue as approval_queue
+    participant Human as Human (Approvals tab / CLI)
+    participant RZP as razorpay_client
+    Agent->>API: POST /v1/authorize
+    API->>Svc: authorize()
+    Svc->>Svc: evaluate() -> NEEDS_HUMAN, nonce reserved now
+    Svc->>Explain: explain() -- cannot alter the decision
+    Svc->>Queue: enqueue(status=pending)
+    Svc-->>API: 202 Accepted + request_id
+    Human->>Svc: resolve_approval(approved=true)
+    Svc->>Queue: status=approved_pending_execution
+    Svc->>RZP: create_order(receipt=request_id)
+    alt succeeds
+        RZP-->>Svc: order
+        Svc->>Queue: status=executed
+    else fails, retryable
+        RZP-->>Svc: error
+        Note over Svc,RZP: retry later, idempotent on the same receipt
+    end
+    </pre>
+
+    <h3>failed_check taxonomy</h3>
+    <div class="tablewrap"><table>
+      <tr><th>value</th><th>outcome</th><th>meaning</th></tr>
+      <tr><td><code>invalid_amount</code></td><td><span class="pill deny">DENY</span></td><td>amount isn't a positive finite number</td></tr>
+      <tr><td><code>unknown_principal</code></td><td><span class="pill deny">DENY</span></td><td>no key registered for this principal at all</td></tr>
+      <tr><td><code>signature</code></td><td><span class="pill deny">DENY</span></td><td>registered principal, signature doesn't verify</td></tr>
+      <tr><td><code>expiry</code></td><td><span class="pill deny">DENY</span></td><td>mandate has expired</td></tr>
+      <tr><td><code>merchant_match</code></td><td><span class="pill deny">DENY</span></td><td>ACP token bound to a different merchant</td></tr>
+      <tr><td><code>amount_cap</code></td><td><span class="pill deny">DENY</span></td><td>amount exceeds the mandate's ceiling</td></tr>
+      <tr><td><code>category_scope</code></td><td><span class="pill deny">DENY</span></td><td>category not in the mandate's scope</td></tr>
+      <tr><td><code>human_review_threshold</code></td><td><span class="pill human">NEEDS_HUMAN</span></td><td>a correct, non-error routing — not a failure</td></tr>
+      <tr><td><code>replay</code></td><td><span class="pill deny">DENY</span></td><td>this mandate_id was already claimed</td></tr>
+      <tr><td><code>human_review_denied</code></td><td><span class="pill deny">DENY</span></td><td>set by resolve_approval() when a human denies</td></tr>
+      <tr><td><code>null</code></td><td><span class="pill allow">ALLOW</span></td><td>every check passed</td></tr>
+    </table></div>
+  </section>
+
+  <!-- ============ 07 SCALING & ALTERNATIVES ============ -->
+  <section class="panel" id="panel-scaling">
+    <h2 style="font-size:24px; margin-bottom:6px;">Scaling — three stages, one built</h2>
+    <p class="section-lead">"How do you get to 10,000 requests" answered honestly: this system fails at 2 concurrent requests before it becomes slow — see Limitations for the defects that proved it, and how they were fixed.</p>
+
+    <div class="grid2">
+      <div class="card"><h4 style="font-size:14.5px; margin-bottom:8px;">Stage 1 — built, today</h4><p style="font-size:13px; margin:0;">One process. SQLite in WAL mode, per-thread connections. Audit log behind an OS-level lock. Proven correct at 50 concurrent threads × 15 runs against one single-use mandate: exactly one ALLOW, every time.</p></div>
+      <div class="card"><h4 style="font-size:14.5px; margin-bottom:8px;">Stage 2 — designed, not built</h4><p style="font-size:13px; margin:0;">Stateless API replicas behind a load balancer. Postgres <code>ON CONFLICT ... RETURNING</code> replaces SQLite's PRIMARY-KEY trick — same idea, multi-instance-safe. Per-merchant audit chains; a shared Redis rate-limit counter.</p></div>
+    </div>
+    <div class="card"><h4 style="font-size:14.5px; margin-bottom:8px;">Stage 3 — named, not built</h4><p style="font-size:13px; margin:0;">Redis as a hot cache in front of the durable nonce store; async Razorpay execution off a queue, reusing the idempotency-by-receipt guarantee already built for retries.</p></div>
+
+    <p style="margin-top:16px;"><code>policy_engine.evaluate()</code> takes every piece of state as an explicit argument and holds none of its own — swapping the nonce claimer's backing store (SQLite → Postgres) needs zero changes to <code>policy_engine.py</code> itself. That's the payoff of a Stage-1 decision, not a Stage-2 achievement.</p>
+
+    <h2 style="font-size:24px; margin:40px 0 6px 0;">Alternatives weighed</h2>
+    <div class="tablewrap"><table>
+      <tr><th>Decision</th><th>Chosen</th><th>Rejected, and why</th></tr>
+      <tr><td>Protocol strategy</td><td>Normalize AP2 + ACP into one shape</td><td>Deep single-protocol integration — bets on an undeclared winner</td></tr>
+      <tr><td>Where the LLM sits</td><td>Downstream, explanation-only</td><td>LLM-in-the-loop policy — a prompt isn't a function signature</td></tr>
+      <tr><td>Entry points</td><td>HTTP for agents, CLI/dashboard for humans, one <code>service.py</code></td><td>One API replacing the CLI — blurs who's making the call</td></tr>
+      <tr><td>State store (today)</td><td>SQLite, WAL mode</td><td>Postgres/Redis on day one — proves nothing a concurrency test doesn't already prove for a demo with no real traffic</td></tr>
+      <tr><td>Replay check position</td><td>Last, fused atomically into the claim</td><td>Checking replay early — turns it into a DoS primitive</td></tr>
+      <tr><td>Approval states</td><td>Three, including a non-terminal "approved_pending_execution"</td><td>Two states — hides whether Razorpay's order actually got created</td></tr>
+      <tr><td>Signature scope</td><td>Per-principal key registry</td><td>One shared demo keypair — proves only "a trusted key," not "this principal"</td></tr>
+    </table></div>
+  </section>
+
+  <!-- ============ 08 LIMITATIONS ============ -->
+  <section class="panel" id="panel-limitations">
+    <h2 style="font-size:24px; margin-bottom:6px;">Attacks blocked, and the honest limitations</h2>
+    <p class="section-lead">Volunteering weaknesses first, not a formality before Q&amp;A. Six real defects, found by adversarial and concurrency testing, fixed, and now permanent regression tests.</p>
+
+    <div class="tablewrap"><table>
+      <tr><th>ID</th><th>What broke</th><th>Fix</th></tr>
+      <tr><td>D1</td><td>Replay was check-then-add — 2 concurrent requests on one mandate could both read "unspent"</td><td>Single atomic <code>INSERT</code>, PRIMARY KEY enforces it</td></tr>
+      <tr><td>D2</td><td>Audit log read-tip-then-write raced — concurrent writers forked the chain with no tampering at all</td><td>OS-level lock around the whole read-then-write</td></tr>
+      <tr><td>D3</td><td>Shared SQLite connection across threads — real <code>OperationalError</code>s, once a raw <code>SystemError</code></td><td>Per-thread connection + WAL + <code>busy_timeout</code></td></tr>
+      <tr><td>D4</td><td>NEEDS_HUMAN never reserved its nonce — one mandate resubmitted 3× produced 3 approvable orders</td><td><code>evaluate()</code> claims the nonce the moment it reaches NEEDS_HUMAN</td></tr>
+      <tr><td>D5</td><td>No lower bound on amount — 0, negative, and NaN all returned ALLOW</td><td>Schema + runtime both check <code>isfinite(amount) and amount &gt; 0</code></td></tr>
+      <tr><td>D6</td><td>"approved" was committed before the Razorpay call ran — a crash in between looked identical to success</td><td>New non-terminal <code>approved_pending_execution</code> state</td></tr>
+    </table></div>
+
+    <h3>Adversarial coverage</h3>
+    <div class="badgebar">
+      <span class="badge">prompt-injected buyer agent</span>
+      <span class="badge">replayed mandate</span>
+      <span class="badge">expired mandate</span>
+      <span class="badge">cross-merchant token reuse</span>
+      <span class="badge">cap-exceeding request</span>
+      <span class="badge">poisoned catalog listing</span>
+      <span class="badge">forged / tampered signature</span>
+    </div>
+    <p>42 scored cases in <code>evals/</code>, distinct from the pytest suite — 33% deliberately legitimate traffic, because a corpus that's all attacks can't measure false positives. Both suites run on every push via CI.</p>
+
+    <h3>Named, not hidden</h3>
+    <ul style="color:var(--ink-soft); font-size:13.5px; padding-left:20px;">
+      <li style="margin-bottom:8px;">Key rotation and issuance are out of scope — three hardcoded demo principals.</li>
+      <li style="margin-bottom:8px;">Multi-instance coordination beyond Stage 1 is not built.</li>
+      <li style="margin-bottom:8px;">The 50% human-review threshold is a defensible round number, not tuned against real fraud data.</li>
+      <li style="margin-bottom:8px;"><code>decide_with_llm()</code>'s live prompt-injection path needs a real API key and isn't exercised by CI.</li>
+      <li>Razorpay integration stops at order creation — a full payment round-trip needs a checkout frontend.</li>
+    </ul>
+  </section>
+</main>
+
+<footer>
+  Darwaza · Razorpay AI Buildathon, Track 01 · this console is a read/demo layer — see docs/HLD.md for why it sits outside the trust boundary.
+</footer>
+
+<script src="vendor/mermaid.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
