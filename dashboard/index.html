@@ -32,8 +32,10 @@
   <button class="tabbtn" data-tab="audit"><span class="n">04</span>Audit Trail</button>
   <button class="tabbtn" data-tab="hld"><span class="n">05</span>Architecture</button>
   <button class="tabbtn" data-tab="lld"><span class="n">06</span>Design</button>
-  <button class="tabbtn" data-tab="scaling"><span class="n">07</span>Scaling &amp; Alternatives</button>
-  <button class="tabbtn" data-tab="limitations"><span class="n">08</span>Limitations</button>
+  <button class="tabbtn" data-tab="stack"><span class="n">07</span>Tech &amp; Keys</button>
+  <button class="tabbtn" data-tab="concepts"><span class="n">08</span>Concepts</button>
+  <button class="tabbtn" data-tab="scaling"><span class="n">09</span>Scaling &amp; Alternatives</button>
+  <button class="tabbtn" data-tab="limitations"><span class="n">10</span>Limitations</button>
 </nav>
 
 <main>
@@ -282,7 +284,46 @@ sequenceDiagram
     </table></div>
   </section>
 
-  <!-- ============ 07 SCALING & ALTERNATIVES ============ -->
+  <!-- ============ 07 TECH & API KEYS ============ -->
+  <section class="panel" id="panel-stack">
+    <h2 style="font-size:24px; margin-bottom:6px;">Technology used — and API keys</h2>
+    <p class="section-lead">Every dependency earns its place, and every key has a stated reason and a stated fallback if it's missing.</p>
+
+    <div class="tablewrap"><table>
+      <tr><th>Layer</th><th>Choice</th><th>Why this, not the obvious alternative</th></tr>
+      <tr><td>Schema / validation</td><td><code>pydantic</code> 2.9</td><td>Rejects malformed amounts (negative, NaN, &plusmn;infinity) at the type layer, before <code>evaluate()</code> ever runs</td></tr>
+      <tr><td>Signatures</td><td><code>cryptography</code> (Ed25519)</td><td>Fast, small keys, no parameter choices to defend under questioning &mdash; unlike RSA&apos;s key-size/padding decisions</td></tr>
+      <tr><td>HTTP layer</td><td><code>FastAPI</code> + <code>uvicorn</code></td><td>Pydantic-native, async, OpenAPI docs for free &mdash; versus hand-rolling validation on Flask</td></tr>
+      <tr><td>Concurrency-safe file lock</td><td><code>portalocker</code></td><td>Cross-platform OS-level lock for the audit log&apos;s read-then-write &mdash; closes the exact race a naive <code>threading.Lock</code> misses across processes</td></tr>
+      <tr><td>State stores</td><td>SQLite, WAL mode, per-thread connections</td><td>Correct concurrency without standing up Postgres for a single-merchant demo &mdash; see Scaling for where this stops being enough, on purpose</td></tr>
+      <tr><td>LLM (optional)</td><td>Anthropic API, downstream-only</td><td>Used in exactly one place &mdash; explaining a NEEDS_HUMAN decision already made &mdash; never in a position to make one</td></tr>
+      <tr><td>Payments</td><td>Razorpay test-mode Orders API</td><td>Order creation only, retry + idempotency-by-receipt &mdash; a full checkout round-trip needs a frontend, out of scope</td></tr>
+    </table></div>
+
+    <h3>API keys &mdash; where, how, and why</h3>
+    <div class="grid2">
+      <div class="card"><h4 style="font-size:14.5px; margin-bottom:8px;">Ed25519 demo keypairs</h4><p style="font-size:13px; margin:0;">Three hardcoded principal keypairs in <code>keys.py</code>, checked into source on purpose &mdash; the repo runs for anyone who clones it, zero setup. Never acceptable for a real signing key; these are worthless outside this demo.</p></div>
+      <div class="card"><h4 style="font-size:14.5px; margin-bottom:8px;"><code>ANTHROPIC_API_KEY</code></h4><p style="font-size:13px; margin:0;">Read at call time in <code>llm_explainer.py</code>. Missing key &rarr; a labeled fallback template, not a crash. Only powers the plain-language explanation text on a NEEDS_HUMAN result.</p></div>
+      <div class="card"><h4 style="font-size:14.5px; margin-bottom:8px;"><code>RAZORPAY_KEY_ID</code> / <code>_SECRET</code></h4><p style="font-size:13px; margin:0;">Test-mode keys from the Razorpay dashboard, validated at startup &mdash; not discovered missing mid-transaction. No keys &rarr; order creation fails loudly, never silently.</p></div>
+      <div class="card"><h4 style="font-size:14.5px; margin-bottom:8px;">Why validate at startup</h4><p style="font-size:13px; margin:0;"><code>config.py</code>&apos;s whole reason to exist: a credential problem should surface when the service boots, not three steps into a live demo in front of a panel.</p></div>
+    </div>
+  </section>
+
+  <!-- ============ 08 CORE CONCEPTS ============ -->
+  <section class="panel" id="panel-concepts">
+    <h2 style="font-size:24px; margin-bottom:6px;">Core concepts</h2>
+    <p class="section-lead">The five ideas the rest of the system is built to protect.</p>
+
+    <div class="grid2">
+      <div class="card"><h4 style="font-size:14.5px; margin-bottom:8px;">A gate, not an agent</h4><p style="font-size:13px; margin:0;">Exactly one LLM call, strictly downstream of an already-final decision, structurally unable to influence it. The buying agent &mdash; simulated here, and the attacker in the test suite &mdash; is the real agent.</p></div>
+      <div class="card"><h4 style="font-size:14.5px; margin-bottom:8px;">Determinism as a security property</h4><p style="font-size:13px; margin:0;"><code>evaluate()</code> is a pure function: same inputs, same output, every time. That&apos;s what makes it testable, auditable, and trivially horizontal &mdash; see Scaling.</p></div>
+      <div class="card"><h4 style="font-size:14.5px; margin-bottom:8px;">Per-principal signatures, not a shared trust bit</h4><p style="font-size:13px; margin:0;">A registry keyed by <code>principal_id</code> proves &quot;signed by this specific principal,&quot; not just &quot;signed by a trusted key&quot; &mdash; an unregistered principal fails differently from a wrong signature.</p></div>
+      <div class="card"><h4 style="font-size:14.5px; margin-bottom:8px;">Tamper-evident, not tamper-proof</h4><p style="font-size:13px; margin:0;">Every audit entry hashes in the previous entry&apos;s hash. Tampering any entry breaks every hash after it &mdash; that&apos;s what a dispute-reconstruction trail needs to prove.</p></div>
+    </div>
+    <div class="card" style="margin-top:16px;"><h4 style="font-size:14.5px; margin-bottom:8px;">Rate limiting is a control, not hygiene</h4><p style="font-size:13px; margin:0;">A human makes three purchases an hour; a looping agent makes three thousand. The token bucket sits ahead of <code>evaluate()</code> and returns 429 without ever touching the nonce store, audit log, or a Decision &mdash; 429 means &quot;not evaluated yet,&quot; not an eighth policy check with an opinion.</p></div>
+  </section>
+
+  <!-- ============ 09 SCALING & ALTERNATIVES ============ -->
   <section class="panel" id="panel-scaling">
     <h2 style="font-size:24px; margin-bottom:6px;">Scaling — three stages, one built</h2>
     <p class="section-lead">"How do you get to 10,000 requests" answered honestly: this system fails at 2 concurrent requests before it becomes slow — see Limitations for the defects that proved it, and how they were fixed.</p>
@@ -308,10 +349,10 @@ sequenceDiagram
     </table></div>
   </section>
 
-  <!-- ============ 08 LIMITATIONS ============ -->
+  <!-- ============ 10 LIMITATIONS ============ -->
   <section class="panel" id="panel-limitations">
     <h2 style="font-size:24px; margin-bottom:6px;">Attacks blocked, and the honest limitations</h2>
-    <p class="section-lead">Volunteering weaknesses first, not a formality before Q&amp;A. Six real defects, found by adversarial and concurrency testing, fixed, and now permanent regression tests.</p>
+    <p class="section-lead">Six real defects, found by adversarial and concurrency testing, fixed, and now permanent regression tests.</p>
 
     <div class="tablewrap"><table>
       <tr><th>ID</th><th>What broke</th><th>Fix</th></tr>
